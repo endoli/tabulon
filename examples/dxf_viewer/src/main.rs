@@ -575,9 +575,8 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                         .td
                         .render_layer
                         .filter(|ih| match viewer.td.graphics.get(*ih) {
-                            Some(GraphicsItem::FatShape(..)) => visible.binary_search(ih).is_ok(),
-                            Some(GraphicsItem::FatText(..)) => visible_text.contains(ih),
-                            _ => false,
+                            GraphicsItem::FatShape(..) => visible.binary_search(ih).is_ok(),
+                            GraphicsItem::FatText(..) => visible_text.contains(ih),
                         });
                 self.scene.reset();
                 self.tv_environment.add_render_layer_to_scene(
@@ -603,9 +602,9 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                         .iter()
                         .filter(|ih| viewer.td.item_entity_map[ih] == pick)
                         .for_each(|ih| {
-                            let Some(GraphicsItem::FatShape(FatShape {
+                            let GraphicsItem::FatShape(FatShape {
                                 transform, path, ..
-                            })) = viewer.td.graphics.get(*ih)
+                            }) = viewer.td.graphics.get(*ih)
                             else {
                                 return;
                             };
@@ -648,11 +647,10 @@ fn load_drawing(p: impl AsRef<Path>) -> Result<TDDrawing> {
         let mut text_count = 0;
         for item_handle in drawing.item_entity_map.keys() {
             match drawing.graphics.get(*item_handle) {
-                Some(GraphicsItem::FatShape(FatShape { path, .. })) => {
+                GraphicsItem::FatShape(FatShape { path, .. }) => {
                     segment_count += path.segments().count();
                 }
-                Some(GraphicsItem::FatText(_)) => text_count += 1,
-                None => {}
+                GraphicsItem::FatText(_) => text_count += 1,
             }
         }
         eprintln!(
@@ -778,11 +776,9 @@ fn light_adapt_paints(graphics: &mut GraphicsBag, render_layer: &RenderLayer) {
     let paint_handles: BTreeSet<PaintHandle> = render_layer
         .indices
         .iter()
-        .flat_map(|ih| {
-            graphics.get(*ih).map(|i| match i {
-                GraphicsItem::FatShape(s) => s.paint,
-                GraphicsItem::FatText(t) => t.paint,
-            })
+        .map(|ih| match graphics.get(*ih) {
+            GraphicsItem::FatShape(s) => s.paint,
+            GraphicsItem::FatText(t) => t.paint,
         })
         .collect();
 
@@ -819,7 +815,7 @@ impl EntityIndex {
         let mut entity_mapping = vec![];
         let mut item_mapping = vec![];
         for (k, v) in d.item_entity_map.iter() {
-            let Some(GraphicsItem::FatShape(FatShape { path, .. })) = d.graphics.get(*k) else {
+            let GraphicsItem::FatShape(FatShape { path, .. }) = d.graphics.get(*k) else {
                 continue;
             };
 

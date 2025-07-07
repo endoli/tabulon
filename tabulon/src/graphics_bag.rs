@@ -96,8 +96,14 @@ impl GraphicsBag {
 
     /// Get an individual [`GraphicsItem`].
     #[must_use]
-    pub fn get(&self, idx: ItemHandle) -> Option<&GraphicsItem> {
-        self.items.get(idx.0 as usize)
+    pub fn get(&self, idx: ItemHandle) -> &GraphicsItem {
+        &self.items[idx.0 as usize]
+    }
+
+    /// Get an individual [`GraphicsItem`].
+    #[must_use]
+    pub fn get_mut(&mut self, idx: ItemHandle) -> &mut GraphicsItem {
+        &mut self.items[idx.0 as usize]
     }
 
     /// Register a paint.
