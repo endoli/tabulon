@@ -4,6 +4,8 @@
 
 //! DXF viewer
 
+#![windows_subsystem = "windows"]
+
 use anyhow::Result;
 use joto_constants::u64::{INCH, MICROMETER};
 use std::num::NonZeroUsize;
