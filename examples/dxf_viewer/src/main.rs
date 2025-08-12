@@ -2,7 +2,34 @@
 // Copyright 2025 the Tabulon Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! DXF viewer
+//! Tabulon DXF viewer
+//!
+//! Drag and drop DXF (text or binary format) files onto the viewer window to open them, or provide
+//! a path on the command line.
+//!
+//! ## Limitations
+//!
+//! This viewer is focused exclusively on 2D vector drawing content inside DXFs, and does not render
+//! 3D content.
+//!
+//! Here is a list of entities supported in their simple plotter/solid style, facing +Z:
+//!
+//! - `ARC`
+//! - `LINE`
+//! - `CIRCLE`
+//! - `ELLIPSE`
+//! - `LWPOLYLINE`
+//! - `POLYLINE`
+//! - `SPLINE`
+//! - `SOLID`
+//! - `TEXT`
+//! - `MTEXT`
+//!
+//! In `TEXT` and `MTEXT`, inline style definitions are not currently supported, and not all special
+//! character escapes are translated properly or at all.
+//!
+//! In general, this viewer is quite scalable, but will struggle when the density of elements in a
+//! given position is high enough, due to limitations in the classic Vello rendering process.
 
 #![windows_subsystem = "windows"]
 
