@@ -690,6 +690,8 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                     (line_weight, color)
                 };
 
+                let base_point = point_from_dxf_point(&b.base_point);
+
                 let mut cur_style = resolve_style(
                     handle_for_layer_name[b.entities[0].common.layer.as_str()],
                     b.entities[0].common.lineweight_enum_value,
@@ -731,7 +733,8 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                                     ins.x_scale_factor,
                                     ins.y_scale_factor,
                                 );
-                                let location = point_from_dxf_point(&ins.location);
+                                let location =
+                                    point_from_dxf_point(&ins.location) - base_point.to_vec2();
 
                                 if !lines.is_empty() {
                                     // Always push a chunk before an insert if not empty.
