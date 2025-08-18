@@ -22,7 +22,7 @@ tracy-client = { workspace = true, optional = true }
 ui-events = "0.1.0"
 ui-events-winit = "0.1.0"
 vello = "0.5.0"
-winit = "0.30.10"
+winit = { version = "0.30.10", default-features = false }
 
 static_aabb2d_index = { version = "2.0.0", features = ["unsafe_optimizations"] }
 

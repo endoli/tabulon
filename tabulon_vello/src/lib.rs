@@ -111,6 +111,11 @@ impl Environment {
                             let mut x = glyph_run.offset();
                             let y = glyph_run.baseline();
                             let run = glyph_run.run();
+
+                            // Vello has a hard time drawing glyphs either very large or very
+                            // small, so we render at 1000 units regardless, and then transform.
+                            let fudge = run.font_size() as f64 / 1000.0;
+
                             let synthesis = run.synthesis();
                             scene
                                 .draw_glyphs(run.font())
@@ -119,15 +124,15 @@ impl Environment {
                                 .hint(false)
                                 .transform(transform * placement_transform)
                                 .glyph_transform(Some(if let Some(angle) = synthesis.skew() {
-                                    Affine::scale(50_f64.recip())
+                                    Affine::scale(fudge)
                                         * Affine::skew(angle.to_radians().tan() as f64, 0.0)
                                 } else {
-                                    Affine::scale(50_f64.recip())
+                                    Affine::scale(fudge)
                                 }))
                                 // Small font sizes are quantized, multiplying by
                                 // 50 and then scaling by 1 / 50 at the glyph level
                                 // works around this, but it is a hack.
-                                .font_size(run.font_size() * 50.0)
+                                .font_size(1000_f32)
                                 .normalized_coords(run.normalized_coords())
                                 .draw(
                                     Fill::NonZero,
