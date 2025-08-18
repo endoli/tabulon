@@ -4,14 +4,19 @@
 //! DXF loader for Tabulon
 
 pub use dxf;
-use dxf::{Drawing, DxfResult, entities::EntityType};
+use dxf::{
+    Drawing, DxfResult,
+    entities::EntityType,
+    enums::{HorizontalTextJustification, VerticalTextJustification},
+};
 
 use tabulon::{
     DirectIsometry, GraphicsBag, GraphicsItem, ItemHandle, PaintHandle,
     peniko::{
         Color,
         kurbo::{
-            Affine, Arc, BezPath, Circle, DEFAULT_ACCURACY, PathEl, Point, Shape, Stroke, Vec2,
+            Affine, Arc, BezPath, Circle, DEFAULT_ACCURACY, Line, PathEl, Point, Shape, Stroke,
+            Vec2,
         },
     },
     render_layer::RenderLayer,
@@ -31,7 +36,7 @@ use alloc::{
 #[cfg(feature = "std")]
 use std::path::Path;
 
-use core::{cmp::Ordering, num::NonZeroU64};
+use core::{cmp::Ordering, mem::discriminant, num::NonZeroU64};
 
 mod aci_palette;
 use aci_palette::ACI;
@@ -43,6 +48,267 @@ pub struct EntityHandle(pub(crate) NonZeroU64);
 /// A valid handle for a [`Layer`](dxf::tables::Layer) present in the drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LayerHandle(pub(crate) NonZeroU64);
+
+#[derive(Debug, Clone)]
+struct TextItem {
+    text: sync::Arc<str>,
+    style: StyleSet<Option<Color>>,
+    alignment: Alignment,
+    insertion: DirectIsometry,
+    max_inline_size: Option<f32>,
+    attachment_point: AttachmentPoint,
+}
+
+/// An chunk of things drawn in order.
+#[derive(Debug, Clone, Default)]
+enum BlockChunk {
+    /// Something not yet supported.
+    #[default]
+    Unsupported,
+    /// Path with a particular color and weight.
+    Path(i16, i16, BezPath),
+    /// Text item. DXF color enum and [`TextItem`].
+    Text(i16, TextItem),
+}
+
+/// Convert an entity to a [`BlockChunk`].
+fn chunk_from_entity(
+    e: &dxf::entities::Entity,
+    styles: &BTreeMap<&str, StyleSet<Option<Color>>>,
+) -> BlockChunk {
+    let ce = recover_color_enum(&e.common.color);
+    match e.specific {
+        #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
+        EntityType::MText(ref mt) => {
+            // FIXME: currently only support viewing from +Z.
+            if mt.extrusion_direction.z != 1.0 {
+                return BlockChunk::Unsupported;
+            }
+
+            // TODO: Parse MTEXT encoded characters to Unicode equivalents.
+            // TODO: Set up background fills.
+            // TODO: Handle inline style changes?
+            // TODO: Handle columns.
+            // TODO: Handle paragraph styles.
+            // TODO: Handle rotation.
+            let mut nt = mt.text.clone();
+            for ext in mt.extended_text.iter() {
+                nt.push_str(ext);
+            }
+
+            // TODO: Implement a shared parser for scanning formatting codes into styled text
+            //       and doing unicode substitution for special character codes.
+            let nt = nt
+                .replace("%%c", "∅")
+                .replace("%%d", "°")
+                .replace("%%p", "±")
+                .replace("%%C", "∅")
+                .replace("%%D", "°")
+                .replace("%%P", "±")
+                .replace("%%%", "%")
+                // TODO: Implement start/stop underline with styled text.
+                .replace("\\L", "")
+                .replace("\\l", "")
+                // TODO: Implement start/stop overline with styled text.
+                .replace("\\O", "")
+                .replace("\\o", "")
+                // TODO: Implement start/stop strikethrough with styled text.
+                .replace("\\S", "")
+                .replace("\\s", "")
+                .replace("\\P", "\n")
+                .replace("\\A1;", "")
+                .replace("\\A0;", "")
+                .replace("\\pxqc;", "")
+                .replace("\\pxql;", "")
+                .replace("\\pxqr;", "");
+
+            let x_angle = Vec2 {
+                x: mt.x_axis_direction.x,
+                y: -mt.x_axis_direction.y,
+            }
+            .atan2();
+
+            let attachment_point = dxf_attachment_point_to_tabulon(mt.attachment_point);
+
+            // In DXF, the text alignment is also decided by the attachment point.
+            let alignment = {
+                use Alignment::*;
+                use AttachmentPoint::*;
+                match attachment_point {
+                    TopCenter | MiddleCenter | BottomCenter => Middle,
+                    TopLeft | MiddleLeft | BottomLeft => Left,
+                    TopRight | MiddleRight | BottomRight => Right,
+                }
+            };
+
+            let max_inline_size = if alignment == Alignment::Middle {
+                None
+            } else {
+                match mt.column_type {
+                    0 => (mt.reference_rectangle_width != 0.0)
+                        .then_some(mt.reference_rectangle_width as f32),
+                    1 => (mt.column_width != 0.0).then_some(mt.column_width as f32),
+                    _ => None,
+                }
+            };
+
+            BlockChunk::Text(
+                ce,
+                TextItem {
+                    text: nt.into(),
+                    // TODO: Map more styling information from the MText
+                    style: styles.get(mt.text_style_name.as_str()).map_or_else(
+                        || StyleSet::new(mt.initial_text_height as f32),
+                        |s| {
+                            if style_size_is_zero(s) {
+                                let mut news = s.clone();
+                                news.insert(StyleProperty::FontSize(mt.initial_text_height as f32));
+                                news
+                            } else {
+                                s.clone()
+                            }
+                        },
+                    ),
+                    alignment,
+                    insertion: DirectIsometry::new(
+                        // As far as I'm aware, x_axis_direction and rotation are exclusive.
+                        -mt.rotation_angle.to_radians() + x_angle,
+                        point_from_dxf_point(&mt.insertion_point).to_vec2(),
+                    ),
+                    max_inline_size,
+                    attachment_point,
+                },
+            )
+        }
+        #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
+        EntityType::Text(ref t) => {
+            // FIXME: currently only support viewing from +Z.
+            if t.normal.z != 1.0 {
+                return BlockChunk::Unsupported;
+            }
+
+            // TODO: Handle second_alignment_point etc?
+            // TODO: Handle relative_x_scale_factor.
+
+            // TODO: Implement a shared parser for scanning formatting codes into styled text
+            //       and doing unicode substitution for special character codes.
+            let text = t
+                .value
+                .replace("%%c", "∅")
+                .replace("%%d", "°")
+                .replace("%%p", "±")
+                .replace("%%C", "∅")
+                .replace("%%D", "°")
+                .replace("%%P", "±")
+                .replace("%%%", "%")
+                // TODO: implement toggle underline with styled text.
+                .replace("%%u", "")
+                // TODO: implement toggle overline with styled text.
+                .replace("%%o", "");
+
+            let attachment_point = {
+                use HorizontalTextJustification as H;
+                use VerticalTextJustification as V;
+                match (
+                    t.horizontal_text_justification,
+                    t.vertical_text_justification,
+                ) {
+                    (H::Left, V::Top) => AttachmentPoint::TopLeft,
+                    (H::Center | H::Middle, V::Top) => AttachmentPoint::TopCenter,
+                    (H::Right, V::Top) => AttachmentPoint::TopRight,
+                    (H::Left, V::Middle) => AttachmentPoint::MiddleLeft,
+                    (H::Center | H::Middle, V::Middle) => AttachmentPoint::MiddleCenter,
+                    (H::Right, V::Middle) => AttachmentPoint::MiddleRight,
+                    (H::Left, V::Bottom) => AttachmentPoint::BottomLeft,
+                    (H::Center | H::Middle, V::Bottom) => AttachmentPoint::BottomCenter,
+                    (H::Right, V::Bottom) => AttachmentPoint::BottomRight,
+                    (H::Left, V::Baseline) => AttachmentPoint::BottomLeft,
+                    (H::Center | H::Middle, V::Baseline) => AttachmentPoint::BottomCenter,
+                    (H::Right, V::Baseline) => AttachmentPoint::BottomRight,
+                    // These need further attention.
+                    (H::Aligned | H::Fit, V::Top) => AttachmentPoint::TopLeft,
+                    (H::Aligned | H::Fit, V::Middle) => AttachmentPoint::MiddleLeft,
+                    (H::Aligned | H::Fit, V::Bottom) => AttachmentPoint::BottomLeft,
+                    (H::Aligned | H::Fit, V::Baseline) => AttachmentPoint::BottomLeft,
+                }
+            };
+
+            let alignment = {
+                use HorizontalTextJustification::*;
+                match t.horizontal_text_justification {
+                    Left => Alignment::Left,
+                    Right => Alignment::Right,
+                    Center => Alignment::Middle,
+                    Middle => Alignment::Middle,
+                    // These need further attention.
+                    Aligned | Fit => Alignment::Left,
+                }
+            };
+
+            let angle = {
+                use HorizontalTextJustification as H;
+                match t.horizontal_text_justification {
+                    H::Aligned | H::Fit => (point_from_dxf_point(&t.second_alignment_point)
+                        .to_vec2()
+                        - point_from_dxf_point(&t.location).to_vec2())
+                    .angle(),
+                    _ => -t.rotation.to_radians(),
+                }
+            };
+
+            let displacement = {
+                use HorizontalTextJustification as H;
+                match t.horizontal_text_justification {
+                    H::Center => point_from_dxf_point(&t.second_alignment_point).to_vec2(),
+                    _ => point_from_dxf_point(&t.location).to_vec2(),
+                }
+            };
+
+            BlockChunk::Text(
+                ce,
+                TextItem {
+                    text: text.into(),
+                    style: styles.get(t.text_style_name.as_str()).map_or_else(
+                        || StyleSet::new(t.text_height as f32),
+                        |s| {
+                            let mut sized = if style_size_is_zero(s) {
+                                let mut news = s.clone();
+                                news.insert(StyleProperty::FontSize(t.text_height as f32));
+                                news
+                            } else {
+                                s.clone()
+                            };
+                            if t.oblique_angle != 0.0 {
+                                sized.insert(StyleProperty::FontStyle(FontStyle::Oblique(Some(
+                                    t.oblique_angle as f32,
+                                ))));
+                            }
+                            sized
+                        },
+                    ),
+                    alignment,
+                    insertion: DirectIsometry {
+                        angle,
+                        displacement,
+                    },
+                    max_inline_size: None,
+                    attachment_point,
+                },
+            )
+        }
+        _ => {
+            if let Some(p) = path_from_entity(e) {
+                BlockChunk::Path(
+                    e.common.lineweight_enum_value,
+                    recover_color_enum(&e.common.color),
+                    p,
+                )
+            } else {
+                BlockChunk::Unsupported
+            }
+        }
+    }
+}
 
 /// Convert an entity to a [`BezPath`].
 #[tracing::instrument(skip_all)]
@@ -644,153 +910,6 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
         .map(|l| (LayerHandle(NonZeroU64::new(l.handle.0).unwrap()), l))
         .collect();
 
-    let mut blocks: BTreeMap<&str, Vec<(i16, i16, BezPath)>> = BTreeMap::new();
-    {
-        // Blocks that depend on another block which is not realized.
-        let mut unresolved_blocks: Vec<&dxf::Block> = drawing.blocks().collect();
-        let mut there_is_absolutely_no_hope = false;
-        while !unresolved_blocks.is_empty() && !there_is_absolutely_no_hope {
-            // I acknowledge that this is technically not very efficient in some cases
-            // but I am too lazy to build a DAG here, and rarely will it matter.
-            there_is_absolutely_no_hope = true;
-            'block: for b in unresolved_blocks.iter() {
-                // Form up shapes with contiguous line weight and color.
-                let mut lines = BezPath::new();
-                // Chunk blocks by the combination of line weight and color.
-                // To retain drawing order, multiple chunks may be emitted for a single block.
-                let mut chunks: Vec<(i16, i16, BezPath)> = vec![];
-                if b.entities.is_empty() {
-                    blocks.insert(b.name.as_str(), chunks);
-                    continue;
-                }
-
-                let resolve_style = |lh: LayerHandle, lw: i16, ce: i16| {
-                    let layer = layers[&lh];
-                    let line_weight = if lw == -2 {
-                        if layer.line_weight.raw_value() < 0 {
-                            25_i16
-                        } else {
-                            layer.line_weight.raw_value()
-                        }
-                    } else {
-                        lw
-                    };
-                    let color = if ce == 256 {
-                        // BYLAYER: resolve to a palette value during block resolution.
-                        if let Some(i) = layer.color.index() {
-                            i as i16
-                        } else {
-                            // white if layer doesn't have a resolvable color.
-                            7_i16
-                        }
-                    } else {
-                        ce
-                    };
-
-                    (line_weight, color)
-                };
-
-                let mut cur_style = resolve_style(
-                    handle_for_layer_name[b.entities[0].common.layer.as_str()],
-                    b.entities[0].common.lineweight_enum_value,
-                    recover_color_enum(&b.entities[0].common.color),
-                );
-
-                for e in b.entities.iter() {
-                    let lh = handle_for_layer_name[e.common.layer.as_str()];
-                    let style = resolve_style(
-                        lh,
-                        if matches!(e.specific, EntityType::Solid(..)) {
-                            // Use `i16::MIN` for solid fills.
-                            i16::MIN
-                        } else {
-                            e.common.lineweight_enum_value
-                        },
-                        recover_color_enum(&e.common.color),
-                    );
-                    if style != cur_style {
-                        chunks.push((cur_style.0, cur_style.1, lines));
-                        lines = BezPath::new();
-                        cur_style = style;
-                    }
-
-                    match e.specific {
-                        // Try the next block if this one depends on an unresolved block.
-                        EntityType::Insert(dxf::entities::Insert { ref name, .. })
-                            if !blocks.contains_key(name.as_str()) =>
-                        {
-                            continue 'block;
-                        }
-                        EntityType::Insert(ref ins) => {
-                            // FIXME: currently only support viewing from +Z.
-                            if ins.extrusion_direction.z != 1.0 {
-                                continue;
-                            }
-                            if let Some(b) = blocks.get(ins.name.as_str()) {
-                                let base_transform = Affine::scale_non_uniform(
-                                    ins.x_scale_factor,
-                                    ins.y_scale_factor,
-                                );
-                                let location = point_from_dxf_point(&ins.location);
-
-                                if !lines.is_empty() {
-                                    // Always push a chunk before an insert if not empty.
-                                    chunks.push((cur_style.0, cur_style.1, lines));
-                                }
-
-                                // Push arrayed/transformed versions of each chunk in the block.
-                                for (lw, ce, clines) in b {
-                                    let local_linewidth = if *lw == -1 {
-                                        // BYBLOCK: inherit from this insert.
-                                        cur_style.0
-                                    } else {
-                                        // Other values are already realized in the chunk as
-                                        // either absolute widths, or the default width `-3`.
-                                        *lw
-                                    };
-                                    let local_color = if *ce == 0 {
-                                        // BYBLOCK: inherit from this insert.
-                                        cur_style.1
-                                    } else {
-                                        // Other values are already realized in the chunk.
-                                        *ce
-                                    };
-                                    lines = BezPath::new();
-                                    for i in 0..ins.row_count {
-                                        for j in 0..ins.column_count {
-                                            let transform = base_transform
-                                                .then_translate(Vec2::new(
-                                                    j as f64 * ins.column_spacing,
-                                                    i as f64 * ins.row_spacing,
-                                                ))
-                                                .then_rotate(-ins.rotation.to_radians())
-                                                .then_translate(location.to_vec2());
-                                            // Add the transformed instance to the new path.
-                                            lines.extend(transform * clines);
-                                        }
-                                    }
-                                    chunks.push((local_linewidth, local_color, lines));
-                                }
-                                lines = BezPath::new();
-                            }
-                        }
-                        _ => {
-                            if let Some(s) = path_from_entity(e) {
-                                lines.extend(s);
-                            }
-                        }
-                    }
-                }
-                if !lines.is_empty() {
-                    chunks.push((cur_style.0, cur_style.1, lines));
-                }
-                there_is_absolutely_no_hope = false;
-                blocks.insert(b.name.as_str(), chunks);
-            }
-            unresolved_blocks.retain(|b| !blocks.contains_key(b.name.as_str()));
-        }
-    }
-
     let styles: BTreeMap<&str, StyleSet<Option<Color>>> = drawing
         .styles()
         .map(
@@ -857,6 +976,272 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
             },
         )
         .collect();
+
+    let mut blocks: BTreeMap<&str, Vec<BlockChunk>> = BTreeMap::new();
+    {
+        // Blocks that depend on another block which is not realized.
+        let mut unresolved_blocks: Vec<&dxf::Block> = drawing.blocks().collect();
+        let mut there_is_absolutely_no_hope = false;
+        while !unresolved_blocks.is_empty() && !there_is_absolutely_no_hope {
+            // I acknowledge that this is technically not very efficient in some cases
+            // but I am too lazy to build a DAG here, and rarely will it matter.
+            there_is_absolutely_no_hope = true;
+            'block: for b in unresolved_blocks.iter() {
+                // Form up shapes with contiguous line weight and color.
+                let mut lines = BezPath::new();
+                // Chunk blocks by the combination of line weight and color.
+                // To retain drawing order, multiple chunks may be emitted for a single block.
+                let mut chunks: Vec<BlockChunk> = vec![];
+                if b.entities.is_empty() {
+                    blocks.insert(b.name.as_str(), chunks);
+                    continue;
+                }
+
+                let resolve_style = |lh: LayerHandle, lw: i16, ce: i16| {
+                    let layer = layers[&lh];
+                    let line_weight = if lw == -2 {
+                        if layer.line_weight.raw_value() < 0 {
+                            25_i16
+                        } else {
+                            layer.line_weight.raw_value()
+                        }
+                    } else {
+                        lw
+                    };
+                    let color = if ce == 256 {
+                        // BYLAYER: resolve to a palette value during block resolution.
+                        if let Some(i) = layer.color.index() {
+                            i as i16
+                        } else {
+                            // white if layer doesn't have a resolvable color.
+                            7_i16
+                        }
+                    } else {
+                        ce
+                    };
+
+                    (line_weight, color)
+                };
+
+                let mut cur_style = resolve_style(
+                    handle_for_layer_name[b.entities[0].common.layer.as_str()],
+                    b.entities[0].common.lineweight_enum_value,
+                    recover_color_enum(&b.entities[0].common.color),
+                );
+
+                for e in b.entities.iter() {
+                    let lh = handle_for_layer_name[e.common.layer.as_str()];
+                    let style = resolve_style(
+                        lh,
+                        if matches!(e.specific, EntityType::Solid(..)) {
+                            // Use `i16::MIN` for solid fills.
+                            i16::MIN
+                        } else {
+                            e.common.lineweight_enum_value
+                        },
+                        recover_color_enum(&e.common.color),
+                    );
+                    if style != cur_style {
+                        chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, lines));
+                        lines = BezPath::new();
+                        cur_style = style;
+                    }
+
+                    match e.specific {
+                        // Try the next block if this one depends on an unresolved block.
+                        EntityType::Insert(dxf::entities::Insert { ref name, .. })
+                            if !blocks.contains_key(name.as_str()) =>
+                        {
+                            continue 'block;
+                        }
+                        EntityType::Insert(ref ins) => {
+                            // FIXME: currently only support viewing from +Z.
+                            if ins.extrusion_direction.z != 1.0 {
+                                continue;
+                            }
+                            if let Some(b) = blocks.get(ins.name.as_str()) {
+                                let base_transform = Affine::scale_non_uniform(
+                                    ins.x_scale_factor,
+                                    ins.y_scale_factor,
+                                );
+                                let location = point_from_dxf_point(&ins.location);
+
+                                if !lines.is_empty() {
+                                    // Always push a chunk before an insert if not empty.
+                                    chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, lines));
+                                }
+
+                                for chunk in b {
+                                    match chunk {
+                                        BlockChunk::Path(lw, ce, clines) => {
+                                            let local_linewidth = if *lw == -1 {
+                                                // BYBLOCK: inherit from this insert.
+                                                cur_style.0
+                                            } else {
+                                                // Other values are already realized in the chunk as
+                                                // either absolute widths, or the default width `-3`.
+                                                *lw
+                                            };
+                                            let local_color = if *ce == 0 {
+                                                // BYBLOCK: inherit from this insert.
+                                                cur_style.1
+                                            } else {
+                                                // Other values are already realized in the chunk.
+                                                *ce
+                                            };
+                                            lines = BezPath::new();
+                                            for i in 0..ins.row_count {
+                                                for j in 0..ins.column_count {
+                                                    let transform = base_transform
+                                                        .then_translate(Vec2::new(
+                                                            j as f64 * ins.column_spacing,
+                                                            i as f64 * ins.row_spacing,
+                                                        ))
+                                                        .then_rotate(-ins.rotation.to_radians())
+                                                        .then_translate(location.to_vec2());
+                                                    // Add the transformed instance to the new path.
+                                                    lines.extend(transform * clines);
+                                                }
+                                            }
+                                            chunks.push(BlockChunk::Path(
+                                                local_linewidth,
+                                                local_color,
+                                                lines,
+                                            ));
+                                        }
+                                        #[allow(
+                                            clippy::cast_possible_truncation,
+                                            reason = "It doesn't matter"
+                                        )]
+                                        BlockChunk::Text(ce, ti) => {
+                                            let TextItem {
+                                                text,
+                                                style,
+                                                alignment,
+                                                insertion,
+                                                max_inline_size,
+                                                attachment_point,
+                                            } = ti.clone();
+
+                                            let local_color = if *ce == 0 {
+                                                // BYBLOCK: inherit from this insert.
+                                                cur_style.1
+                                            } else {
+                                                // Other values are already realized in the chunk.
+                                                *ce
+                                            };
+
+                                            let fs = style
+                                                .inner()
+                                                .get(&discriminant(&StyleProperty::FontSize(0.0)))
+                                                .map(|p| {
+                                                    if let StyleProperty::FontSize(fs) = p {
+                                                        *fs
+                                                    } else {
+                                                        0.0
+                                                    }
+                                                });
+
+                                            let displacement_point =
+                                                insertion.displacement.to_point();
+                                            let baseline_vector = Vec2::from_angle(insertion.angle);
+                                            let height_vector = Vec2 {
+                                                x: -baseline_vector.y,
+                                                y: baseline_vector.x,
+                                            };
+                                            let baseline = Line {
+                                                p0: displacement_point,
+                                                p1: displacement_point
+                                                    + (baseline_vector
+                                                        * max_inline_size.unwrap_or(1.0) as f64),
+                                            };
+                                            let hline = Line {
+                                                p0: displacement_point,
+                                                p1: displacement_point
+                                                    + (height_vector * fs.unwrap_or(1.0) as f64),
+                                            };
+
+                                            for i in 0..ins.row_count {
+                                                for j in 0..ins.column_count {
+                                                    let transform = base_transform
+                                                        .then_translate(Vec2::new(
+                                                            j as f64 * ins.column_spacing,
+                                                            i as f64 * ins.row_spacing,
+                                                        ))
+                                                        .then_rotate(-ins.rotation.to_radians())
+                                                        .then_translate(location.to_vec2());
+
+                                                    let tbline = transform * baseline;
+                                                    let thline = transform * hline;
+
+                                                    let angle = (tbline.p1 - tbline.p0).angle();
+                                                    let displacement = tbline.p0.to_vec2();
+
+                                                    let mut style = style.clone();
+                                                    let nfs = thline.length();
+                                                    if fs.is_some() {
+                                                        style.insert(StyleProperty::FontSize(
+                                                            nfs as f32,
+                                                        ));
+                                                    }
+
+                                                    chunks.push(BlockChunk::Text(
+                                                        local_color,
+                                                        TextItem {
+                                                            text: text.clone(),
+                                                            style,
+                                                            alignment,
+                                                            insertion: DirectIsometry {
+                                                                angle,
+                                                                displacement,
+                                                            },
+                                                            max_inline_size: max_inline_size
+                                                                .map(|_| tbline.length() as f32),
+                                                            attachment_point,
+                                                        },
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                lines = BezPath::new();
+                            }
+                        }
+                        _ => match chunk_from_entity(e, &styles) {
+                            BlockChunk::Path(_, _, s) => {
+                                lines.extend(s);
+                            }
+                            BlockChunk::Text(_, ti) => {
+                                // eprintln!("ENCOUNTERED TEXT IN BLOCK DEFINITION");
+                                // eprintln!("{e:#?}");
+                                // eprintln!("{ti:#?}");
+                                if !lines.is_empty() {
+                                    chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, lines));
+                                    lines = BezPath::new();
+                                }
+                                chunks.push(BlockChunk::Text(cur_style.1, ti));
+                            }
+                            BlockChunk::Unsupported => {
+                                if !lines.is_empty() {
+                                    chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, lines));
+                                    lines = BezPath::new();
+                                }
+                                chunks.push(BlockChunk::Unsupported);
+                            }
+                        },
+                    }
+                }
+                if !lines.is_empty() {
+                    chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, lines));
+                }
+                there_is_absolutely_no_hope = false;
+                blocks.insert(b.name.as_str(), chunks);
+            }
+            unresolved_blocks.retain(|b| !blocks.contains_key(b.name.as_str()));
+        }
+    }
 
     // Paints keyed on concrete rgba color, and concrete line width (in iotas).
     let mut paints: BTreeMap<(u32, u64), PaintHandle> = BTreeMap::new();
@@ -979,215 +1364,149 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                         Affine::scale_non_uniform(ins.x_scale_factor, ins.y_scale_factor);
                     let location = point_from_dxf_point(&ins.location);
 
-                    for (lw, ce, clines) in b {
-                        let chunk_paint = resolve_paint(
-                            &mut gb,
-                            if *lw == -1 {
-                                // BYBLOCK: inherit from this insert.
-                                e.common.lineweight_enum_value
-                            } else {
-                                *lw
-                            },
-                            if *ce == 0 {
-                                // BYBLOCK: inherit from this insert.
-                                recover_color_enum(&e.common.color)
-                            } else {
-                                *ce
-                            },
-                        );
-                        let mut path = BezPath::new();
-                        for i in 0..ins.row_count {
-                            for j in 0..ins.column_count {
-                                let transform = base_transform
-                                    .then_translate(Vec2::new(
-                                        j as f64 * ins.column_spacing,
-                                        i as f64 * ins.row_spacing,
-                                    ))
-                                    .then_rotate(-ins.rotation.to_radians())
-                                    .then_translate(location.to_vec2());
+                    for chunk in b {
+                        match chunk {
+                            BlockChunk::Path(lw, ce, clines) => {
+                                let chunk_paint = resolve_paint(
+                                    &mut gb,
+                                    if *lw == -1 {
+                                        // BYBLOCK: inherit from this insert.
+                                        e.common.lineweight_enum_value
+                                    } else {
+                                        *lw
+                                    },
+                                    if *ce == 0 {
+                                        // BYBLOCK: inherit from this insert.
+                                        recover_color_enum(&e.common.color)
+                                    } else {
+                                        *ce
+                                    },
+                                );
+                                let mut path = BezPath::new();
+                                for i in 0..ins.row_count {
+                                    for j in 0..ins.column_count {
+                                        let transform = base_transform
+                                            .then_translate(Vec2::new(
+                                                j as f64 * ins.column_spacing,
+                                                i as f64 * ins.row_spacing,
+                                            ))
+                                            .then_rotate(-ins.rotation.to_radians())
+                                            .then_translate(location.to_vec2());
 
-                                path.extend(transform * clines);
+                                        path.extend(transform * clines);
+                                    }
+                                }
+                                push_item(
+                                    &mut gb,
+                                    FatShape {
+                                        path: sync::Arc::from(path),
+                                        paint: chunk_paint,
+                                        ..Default::default()
+                                    }
+                                    .into(),
+                                );
+                            }
+                            #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
+                            BlockChunk::Text(ce, ti) => {
+                                let TextItem {
+                                    text,
+                                    style,
+                                    alignment,
+                                    insertion,
+                                    max_inline_size,
+                                    attachment_point,
+                                } = ti.clone();
+
+                                let fs = style
+                                    .inner()
+                                    .get(&discriminant(&StyleProperty::FontSize(0.0)))
+                                    .map(|p| {
+                                        if let StyleProperty::FontSize(fs) = p {
+                                            *fs
+                                        } else {
+                                            0.0
+                                        }
+                                    });
+
+                                let displacement_point = insertion.displacement.to_point();
+                                let baseline_vector = Vec2::from_angle(insertion.angle);
+                                let height_vector = Vec2 {
+                                    x: -baseline_vector.y,
+                                    y: baseline_vector.x,
+                                };
+                                let baseline = Line {
+                                    p0: displacement_point,
+                                    p1: displacement_point
+                                        + (baseline_vector * max_inline_size.unwrap_or(1.0) as f64),
+                                };
+                                let hline = Line {
+                                    p0: displacement_point,
+                                    p1: displacement_point
+                                        + (height_vector * fs.unwrap_or(1.0) as f64),
+                                };
+
+                                let paint = resolve_paint(
+                                    &mut gb,
+                                    i16::MIN,
+                                    if *ce == 0 {
+                                        recover_color_enum(&e.common.color)
+                                    } else {
+                                        *ce
+                                    },
+                                );
+
+                                for i in 0..ins.row_count {
+                                    for j in 0..ins.column_count {
+                                        let transform = base_transform
+                                            .then_translate(Vec2::new(
+                                                j as f64 * ins.column_spacing,
+                                                i as f64 * ins.row_spacing,
+                                            ))
+                                            .then_rotate(-ins.rotation.to_radians())
+                                            .then_translate(location.to_vec2());
+
+                                        let tbline = transform * baseline;
+                                        let thline = transform * hline;
+
+                                        let angle = (tbline.p1 - tbline.p0).angle();
+                                        let displacement = tbline.p0.to_vec2();
+
+                                        let mut style = style.clone();
+                                        let nfs = thline.length();
+                                        if fs.is_some() {
+                                            style.insert(StyleProperty::FontSize(nfs as f32));
+                                        }
+
+                                        push_item(
+                                            &mut gb,
+                                            FatText {
+                                                transform: Default::default(),
+                                                paint,
+                                                text: text.clone(),
+                                                style: style.clone(),
+                                                alignment,
+                                                insertion: DirectIsometry {
+                                                    angle,
+                                                    displacement,
+                                                },
+                                                max_inline_size: max_inline_size
+                                                    .map(|_| tbline.length() as f32),
+                                                attachment_point,
+                                            }
+                                            .into(),
+                                        );
+                                    }
+                                }
+                            }
+                            BlockChunk::Unsupported => {
+                                // Maybe do something idk.
                             }
                         }
-                        push_item(
-                            &mut gb,
-                            FatShape {
-                                path: sync::Arc::from(path),
-                                paint: chunk_paint,
-                                ..Default::default()
-                            }
-                            .into(),
-                        );
                     }
                 }
             }
-            #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
-            EntityType::MText(ref mt) => {
-                // FIXME: currently only support viewing from +Z.
-                if mt.extrusion_direction.z != 1.0 {
-                    continue;
-                }
-
-                // TODO: Parse MTEXT encoded characters to Unicode equivalents.
-                // TODO: Set up background fills.
-                // TODO: Handle inline style changes?
-                // TODO: Handle columns.
-                // TODO: Handle paragraph styles.
-                // TODO: Handle rotation.
-                let mut nt = mt.text.clone();
-                for ext in mt.extended_text.iter() {
-                    nt.push_str(ext);
-                }
-
-                // TODO: Implement a shared parser for scanning formatting codes into styled text
-                //       and doing unicode substitution for special character codes.
-                let nt = nt
-                    .replace("%%c", "∅")
-                    .replace("%%d", "°")
-                    .replace("%%p", "±")
-                    .replace("%%C", "∅")
-                    .replace("%%D", "°")
-                    .replace("%%P", "±")
-                    .replace("%%%", "%")
-                    // TODO: Implement start/stop underline with styled text.
-                    .replace("\\L", "")
-                    .replace("\\l", "")
-                    // TODO: Implement start/stop overline with styled text.
-                    .replace("\\O", "")
-                    .replace("\\o", "")
-                    // TODO: Implement start/stop strikethrough with styled text.
-                    .replace("\\S", "")
-                    .replace("\\s", "")
-                    .replace("\\P", "\n")
-                    .replace("\\A1;", "")
-                    .replace("\\A0;", "");
-
-                let x_angle = Vec2 {
-                    x: mt.x_axis_direction.x,
-                    y: -mt.x_axis_direction.y,
-                }
-                .atan2();
-
-                let attachment_point = dxf_attachment_point_to_tabulon(mt.attachment_point);
-
-                // In DXF, the text alignment is also decided by the attachment point.
-                let alignment = {
-                    use Alignment::*;
-                    use AttachmentPoint::*;
-                    match attachment_point {
-                        TopCenter | MiddleCenter | BottomCenter => Middle,
-                        TopLeft | MiddleLeft | BottomLeft => Left,
-                        TopRight | MiddleRight | BottomRight => Right,
-                    }
-                };
-
-                let max_inline_size = if alignment == Alignment::Middle {
-                    None
-                } else {
-                    match mt.column_type {
-                        0 => (mt.reference_rectangle_width != 0.0)
-                            .then_some(mt.reference_rectangle_width as f32),
-                        1 => (mt.column_width != 0.0).then_some(mt.column_width as f32),
-                        _ => None,
-                    }
-                };
-
-                push_item(
-                    &mut gb,
-                    FatText {
-                        transform: Default::default(),
-                        paint: entity_paint,
-                        text: nt.into(),
-                        // TODO: Map more styling information from the MText
-                        style: styles.get(mt.text_style_name.as_str()).map_or_else(
-                            || StyleSet::new(mt.initial_text_height as f32),
-                            |s| {
-                                if style_size_is_zero(s) {
-                                    let mut news = s.clone();
-                                    news.insert(StyleProperty::FontSize(
-                                        mt.initial_text_height as f32,
-                                    ));
-                                    news
-                                } else {
-                                    s.clone()
-                                }
-                            },
-                        ),
-                        alignment,
-                        insertion: DirectIsometry::new(
-                            // As far as I'm aware, x_axis_direction and rotation are exclusive.
-                            -mt.rotation_angle.to_radians() + x_angle,
-                            point_from_dxf_point(&mt.insertion_point).to_vec2(),
-                        ),
-                        max_inline_size,
-                        attachment_point,
-                    }
-                    .into(),
-                );
-            }
-            EntityType::Text(ref t) => {
-                // FIXME: currently only support viewing from +Z.
-                if t.normal.z != 1.0 {
-                    continue;
-                }
-
-                // TODO: Handle second_alignment_point etc?
-                // TODO: Handle relative_x_scale_factor.
-
-                // TODO: Implement a shared parser for scanning formatting codes into styled text
-                //       and doing unicode substitution for special character codes.
-                let text = t
-                    .value
-                    .replace("%%c", "∅")
-                    .replace("%%d", "°")
-                    .replace("%%p", "±")
-                    .replace("%%C", "∅")
-                    .replace("%%D", "°")
-                    .replace("%%P", "±")
-                    .replace("%%%", "%")
-                    // TODO: implement toggle underline with styled text.
-                    .replace("%%u", "")
-                    // TODO: implement toggle overline with styled text.
-                    .replace("%%o", "");
-
-                #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
-                push_item(
-                    &mut gb,
-                    FatText {
-                        transform: Default::default(),
-                        paint: entity_paint,
-                        text: text.into(),
-                        style: styles.get(t.text_style_name.as_str()).map_or_else(
-                            || StyleSet::new(t.text_height as f32),
-                            |s| {
-                                let mut sized = if style_size_is_zero(s) {
-                                    let mut news = s.clone();
-                                    news.insert(StyleProperty::FontSize(t.text_height as f32));
-                                    news
-                                } else {
-                                    s.clone()
-                                };
-                                if t.oblique_angle != 0.0 {
-                                    sized.insert(StyleProperty::FontStyle(FontStyle::Oblique(
-                                        Some(t.oblique_angle as f32),
-                                    )));
-                                }
-                                sized
-                            },
-                        ),
-                        alignment: Default::default(),
-                        insertion: DirectIsometry::new(
-                            -t.rotation.to_radians(),
-                            point_from_dxf_point(&t.location).to_vec2(),
-                        ),
-                        max_inline_size: None,
-                        attachment_point: Default::default(),
-                    }
-                    .into(),
-                );
-            }
-            _ => {
-                if let Some(s) = path_from_entity(e) {
+            _ => match chunk_from_entity(e, &styles) {
+                BlockChunk::Path(_, _, s) => {
                     push_item(
                         &mut gb,
                         FatShape {
@@ -1198,7 +1517,33 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                         .into(),
                     );
                 }
-            }
+                BlockChunk::Text(_, ti) => {
+                    let TextItem {
+                        text,
+                        style,
+                        alignment,
+                        insertion,
+                        max_inline_size,
+                        attachment_point,
+                    } = ti.clone();
+
+                    push_item(
+                        &mut gb,
+                        FatText {
+                            transform: Default::default(),
+                            paint: entity_paint,
+                            text,
+                            style,
+                            alignment,
+                            insertion,
+                            max_inline_size,
+                            attachment_point,
+                        }
+                        .into(),
+                    );
+                }
+                _ => {}
+            },
         }
     }
 
