@@ -496,6 +496,7 @@ name = "dxf_viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dpi",
  "joto_constants",
  "pollster",
  "static_aabb2d_index",
