@@ -43,7 +43,10 @@ use std::time::Instant;
 use tracing_subscriber::prelude::*;
 use ui_events::{
     ScrollDelta,
-    pointer::{PointerButton, PointerEvent, PointerId, PointerInfo, PointerType, PointerUpdate},
+    pointer::{
+        PointerButton, PointerButtonEvent, PointerEvent, PointerId, PointerInfo,
+        PointerScrollEvent, PointerType, PointerUpdate,
+    },
 };
 use ui_events_winit::{WindowEventReducer, WindowEventTranslation};
 use vello::kurbo::{
@@ -286,7 +289,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                 ..
             }
         ) {
-            if let Some(wet) = self.event_reducer.reduce(&event) {
+            if let Some(wet) = self.event_reducer.reduce(window.scale_factor(), &event) {
                 match wet {
                     WindowEventTranslation::Keyboard(k) => {
                         use ui_events::keyboard::{Key, NamedKey};
@@ -300,26 +303,28 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                         };
 
                         match p {
-                            PointerEvent::Down {
-                                pointer:
-                                    PointerInfo {
-                                        pointer_id,
-                                        pointer_type: PointerType::Mouse,
-                                        ..
-                                    },
-                                button: Some(PointerButton::Primary),
-                                state,
-                            }
-                            | PointerEvent::Down {
-                                pointer:
-                                    PointerInfo {
-                                        pointer_id,
-                                        pointer_type: PointerType::Touch,
-                                        ..
-                                    },
-                                state,
-                                ..
-                            } => {
+                            PointerEvent::Down(
+                                PointerButtonEvent {
+                                    pointer:
+                                        PointerInfo {
+                                            pointer_id,
+                                            pointer_type: PointerType::Mouse,
+                                            ..
+                                        },
+                                    button: Some(PointerButton::Primary),
+                                    state,
+                                }
+                                | PointerButtonEvent {
+                                    pointer:
+                                        PointerInfo {
+                                            pointer_id,
+                                            pointer_type: PointerType::Touch,
+                                            ..
+                                        },
+                                    state,
+                                    ..
+                                },
+                            ) => {
                                 if viewer.gestures.pan.is_none() {
                                     viewer.gestures.pan = pointer_id;
                                     viewer.gestures.cursor_pos = Point {
@@ -370,16 +375,16 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
 
                                 viewer.gestures.cursor_pos = p;
                             }
-                            PointerEvent::Up {
+                            PointerEvent::Up(PointerButtonEvent {
                                 pointer: PointerInfo { pointer_id, .. },
                                 ..
-                            }
+                            })
                             | PointerEvent::Cancel(PointerInfo { pointer_id, .. }) => {
                                 if viewer.gestures.pan == pointer_id {
                                     viewer.gestures.pan = None;
                                 }
                             }
-                            PointerEvent::Scroll { delta, .. } => {
+                            PointerEvent::Scroll(PointerScrollEvent { delta, .. }) => {
                                 let d = match delta {
                                     ScrollDelta::LineDelta(_, y) => y as f64 * 0.1,
                                     ScrollDelta::PixelDelta(pd) => pd.y * 0.05,
@@ -537,7 +542,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                 #[cfg(feature = "tracing-tracy")]
                 tracy_client::frame_mark();
 
-                device_handle.device.poll(wgpu::Maintain::Poll);
+                let _ = device_handle.device.poll(wgpu::PollType::Poll);
 
                 if let Some(viewer) = &self.viewer {
                     if viewer.defer_reprojection {

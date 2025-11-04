@@ -18,7 +18,7 @@ To edit the following section, update it in lib.rs, then run:
 cargo rdme --workspace-project=tabulon --heading-base-level=0
 Full documentation at https://github.com/orium/cargo-rdme -->
 
-<!-- Intra-doc links used in lib.rs should be evaluated here. 
+<!-- Intra-doc links used in lib.rs should be evaluated here.
 See https://linebender.org/blog/doc-include/ for related discussion. -->
 [libm]: https://crates.io/crates/libm
 <!-- cargo-rdme start -->
@@ -37,7 +37,7 @@ At least one of `std` and `libm` is required; `std` overrides `libm`.
 
 ## Minimum supported Rust Version (MSRV)
 
-This version of Tabulon has been verified to compile with **Rust 1.85** and later.
+This version of Tabulon has been verified to compile with **Rust 1.86** and later.
 
 Future versions of Tabulon might increase the Rust version requirement.
 It will not be treated as a breaking change and as such can even happen with small patch releases.
