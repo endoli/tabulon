@@ -135,13 +135,13 @@ fn chunk_from_entity(
                 use Alignment::*;
                 use AttachmentPoint::*;
                 match attachment_point {
-                    TopCenter | MiddleCenter | BottomCenter => Middle,
+                    TopCenter | MiddleCenter | BottomCenter => Center,
                     TopLeft | MiddleLeft | BottomLeft => Left,
                     TopRight | MiddleRight | BottomRight => Right,
                 }
             };
 
-            let max_inline_size = if alignment == Alignment::Middle {
+            let max_inline_size = if alignment == Alignment::Center {
                 None
             } else {
                 match mt.column_type {
@@ -228,8 +228,7 @@ fn chunk_from_entity(
                     // These need further attention.
                     (H::Aligned | H::Fit, V::Top) => AttachmentPoint::TopLeft,
                     (H::Aligned | H::Fit, V::Middle) => AttachmentPoint::MiddleLeft,
-                    (H::Aligned | H::Fit, V::Bottom) => AttachmentPoint::BottomLeft,
-                    (H::Aligned | H::Fit, V::Baseline) => AttachmentPoint::BottomLeft,
+                    (H::Aligned | H::Fit, V::Bottom | V::Baseline) => AttachmentPoint::BottomLeft,
                 }
             };
 
@@ -238,8 +237,7 @@ fn chunk_from_entity(
                 match t.horizontal_text_justification {
                     Left => Alignment::Left,
                     Right => Alignment::Right,
-                    Center => Alignment::Middle,
-                    Middle => Alignment::Middle,
+                    Center | Middle => Alignment::Center,
                     // These need further attention.
                     Aligned | Fit => Alignment::Left,
                 }

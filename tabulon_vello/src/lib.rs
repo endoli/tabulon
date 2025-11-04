@@ -141,7 +141,7 @@ impl Environment {
                                         let gy = y - g.y;
                                         x += g.advance;
                                         vello::Glyph {
-                                            id: g.id as _,
+                                            id: g.id,
                                             x: gx,
                                             y: gy,
                                         }
