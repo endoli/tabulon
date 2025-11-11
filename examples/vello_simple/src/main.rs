@@ -281,5 +281,5 @@ fn add_shapes_to_scene(tv_environment: &mut tabulon_vello::Environment, scene: &
         },
     );
 
-    tv_environment.add_render_layer_to_scene(scene, &gb, &rl);
+    tv_environment.add_render_layer_to_scene(scene, &gb, &rl, None);
 }

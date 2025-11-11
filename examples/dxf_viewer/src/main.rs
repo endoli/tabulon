@@ -67,7 +67,7 @@ use vello::wgpu;
 use tabulon_dxf::{EntityHandle, RestrokePaint, TDDrawing};
 
 use tabulon::{
-    GraphicsBag, GraphicsItem, ItemHandle, PaintHandle,
+    DirectIsometry, GraphicsBag, GraphicsItem, ItemHandle, PaintHandle,
     render_layer::RenderLayer,
     shape::{FatPaint, FatShape},
 };
@@ -132,6 +132,9 @@ struct DrawingViewer {
 
     /// State of gesture processing (e.g. panning, zooming).
     gestures: GestureState,
+
+    /// Cache of precomputed text layouts.
+    layout_cache: tabulon_vello::LayoutCache,
 }
 
 struct TabulonDxfViewer<'s> {
@@ -221,9 +224,14 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                     let picking_index = EntityIndex::new(&drawing);
                     let bounds = picking_index.bounds();
 
-                    let text_cull_index = TextCullIndex::new(&mut self.tv_environment, &drawing);
+                    let (layout_cache, measurements) =
+                        self.tv_environment.compute_text_layouts_and_measures(
+                            &drawing.graphics,
+                            &drawing.render_layer,
+                        );
 
-                    let mut scene = Scene::default();
+                    let text_cull_index = TextCullIndex::new(&measurements);
+
                     let view_scale = (size.height as f64 / bounds.size().height)
                         .min(size.width as f64 / bounds.size().width);
 
@@ -243,9 +251,10 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
 
                     let encode_started = Instant::now();
                     self.tv_environment.add_render_layer_to_scene(
-                        &mut scene,
+                        &mut self.scene,
                         &drawing.graphics,
                         &drawing.render_layer,
+                        Some(&layout_cache),
                     );
                     let encode_duration = Instant::now().saturating_duration_since(encode_started);
                     eprintln!("Initial projection/encode took {encode_duration:?}");
@@ -259,6 +268,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                         gestures: GestureState::default(),
                         defer_reprojection: true,
                         pick: None,
+                        layout_cache,
                     });
                 }
                 Err(e) => {
@@ -604,7 +614,11 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                 let picking_index = EntityIndex::new(&drawing);
                 let bounds = picking_index.bounds();
 
-                let text_cull_index = TextCullIndex::new(&mut self.tv_environment, &drawing);
+                let (layout_cache, measurements) = self
+                    .tv_environment
+                    .compute_text_layouts_and_measures(&drawing.graphics, &drawing.render_layer);
+
+                let text_cull_index = TextCullIndex::new(&measurements);
 
                 let view_scale = (surface.config.height as f64 / bounds.size().height)
                     .min(surface.config.width as f64 / bounds.size().width);
@@ -624,6 +638,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                     pick: None,
                     gestures: GestureState::default(),
                     defer_reprojection: false,
+                    layout_cache,
                 });
 
                 reproject = true;
@@ -760,6 +775,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                     &mut self.scene,
                     &viewer.td.graphics,
                     &culled_render_layer,
+                    Some(&viewer.layout_cache),
                 );
 
                 if let Some(pick) = viewer.pick {
@@ -796,7 +812,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                         });
 
                     self.tv_environment
-                        .add_render_layer_to_scene(&mut self.scene, &gb, &rl);
+                        .add_render_layer_to_scene(&mut self.scene, &gb, &rl, None);
                 }
 
                 let reproject_duration =
@@ -1102,15 +1118,14 @@ struct TextCullIndex {
     reason = "The loss of range and precision is acceptable."
 )]
 impl TextCullIndex {
-    fn new(tv_env: &mut tabulon_vello::Environment, d: &TDDrawing) -> Self {
-        let measurements = tv_env.measure_text_items(&d.graphics, &d.render_layer);
+    fn new(measurements: &BTreeMap<ItemHandle, (DirectIsometry, Size)>) -> Self {
         let mut builder = StaticAABB2DIndexBuilder::<f32>::new(measurements.len());
         let mut item_mapping = vec![];
 
         for (ih, (di, s)) in measurements {
-            item_mapping.push(ih);
-            let bbox = (Affine::from(di)
-                * Rect::from_origin_size(Point::ZERO, s).to_path(DEFAULT_ACCURACY))
+            item_mapping.push(*ih);
+            let bbox = (Affine::from(*di)
+                * Rect::from_origin_size(Point::ZERO, *s).to_path(DEFAULT_ACCURACY))
             .bounding_box();
             builder.add(
                 bbox.min_x() as f32,
