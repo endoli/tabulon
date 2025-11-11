@@ -6,7 +6,7 @@
 use tabulon::{
     DirectIsometry, GraphicsBag, GraphicsItem, ItemHandle,
     peniko::{
-        Color, Fill,
+        Brush, Color, Fill,
         kurbo::{Affine, Size, Vec2},
     },
     render_layer::RenderLayer,
@@ -14,7 +14,7 @@ use tabulon::{
     text::{AttachmentPoint, FatText},
 };
 
-use parley::{FontContext, LayoutContext, PositionedLayoutItem};
+use parley::{FontContext, Layout, LayoutContext, PositionedLayoutItem};
 use vello::{Scene, peniko::Fill::NonZero};
 
 extern crate alloc;
@@ -35,6 +35,9 @@ pub struct Environment {
     pub(crate) layout_cx: LayoutContext<Option<Color>>,
 }
 
+/// Convenience type for layout caches.
+pub type LayoutCache = BTreeMap<ItemHandle, Layout<Option<Color>>>;
+
 impl Environment {
     /// Add a [`RenderLayer`] to a Vello [`Scene`].
     #[tracing::instrument(skip_all)]
@@ -43,8 +46,10 @@ impl Environment {
         scene: &mut Scene,
         graphics: &GraphicsBag,
         render_layer: &RenderLayer,
+        layout_cache: Option<&LayoutCache>,
     ) {
-        let Self { font_cx, layout_cx } = self;
+        let font_cx = &mut self.font_cx;
+        let layout_cx = &mut self.layout_cx;
 
         for idx in &render_layer.indices {
             match graphics.get(*idx) {
@@ -79,21 +84,6 @@ impl Environment {
                 }) => {
                     let transform = graphics.get_transform(*transform);
 
-                    let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, false);
-                    for prop in style.inner().values() {
-                        builder.push_default(prop.to_owned());
-                    }
-                    let mut layout = builder.build(text);
-                    layout.break_all_lines(*max_inline_size);
-                    layout.align(*max_inline_size, *alignment, Default::default());
-                    let layout_size = Size {
-                        width: max_inline_size.unwrap_or(layout.width()) as f64,
-                        height: layout.height() as f64,
-                    };
-
-                    let placement_transform = Affine::from(*insertion)
-                        * Affine::translate(-attachment_point.select(layout_size));
-
                     let FatPaint {
                         fill_paint: Some(fill_paint),
                         ..
@@ -102,56 +92,97 @@ impl Environment {
                         continue;
                     };
 
-                    for line in layout.lines() {
-                        for item in line.items() {
-                            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                                continue;
-                            };
+                    if let Some(l) = layout_cache.and_then(|cache| cache.get(idx)) {
+                        let layout_size = Size {
+                            width: max_inline_size.unwrap_or(l.width()) as f64,
+                            height: l.height() as f64,
+                        };
 
-                            let mut x = glyph_run.offset();
-                            let y = glyph_run.baseline();
-                            let run = glyph_run.run();
+                        let placement_transform = Affine::from(*insertion)
+                            * Affine::translate(-attachment_point.select(layout_size));
 
-                            // Vello has a hard time drawing glyphs either very large or very
-                            // small, so we render at 1000 units regardless, and then transform.
-                            let fudge = run.font_size() as f64 / 1000.0;
-
-                            let synthesis = run.synthesis();
-                            scene
-                                .draw_glyphs(run.font())
-                                // TODO: Color will come from styled text.
-                                .brush(fill_paint)
-                                .hint(false)
-                                .transform(transform * placement_transform)
-                                .glyph_transform(Some(if let Some(angle) = synthesis.skew() {
-                                    Affine::scale(fudge)
-                                        * Affine::skew(angle.to_radians().tan() as f64, 0.0)
-                                } else {
-                                    Affine::scale(fudge)
-                                }))
-                                // Small font sizes are quantized, multiplying by
-                                // 50 and then scaling by 1 / 50 at the glyph level
-                                // works around this, but it is a hack.
-                                .font_size(1000_f32)
-                                .normalized_coords(run.normalized_coords())
-                                .draw(
-                                    Fill::NonZero,
-                                    glyph_run.glyphs().map(|g| {
-                                        let gx = x + g.x;
-                                        let gy = y - g.y;
-                                        x += g.advance;
-                                        vello::Glyph {
-                                            id: g.id,
-                                            x: gx,
-                                            y: gy,
-                                        }
-                                    }),
-                                );
+                        draw_layout(scene, transform * placement_transform, l, fill_paint);
+                    } else {
+                        let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, false);
+                        for prop in style.inner().values() {
+                            builder.push_default(prop.to_owned());
                         }
-                    }
+                        let mut l = builder.build(text);
+                        l.break_all_lines(*max_inline_size);
+                        l.align(*max_inline_size, *alignment, Default::default());
+
+                        let layout_size = Size {
+                            width: max_inline_size.unwrap_or(l.width()) as f64,
+                            height: l.height() as f64,
+                        };
+
+                        let placement_transform = Affine::from(*insertion)
+                            * Affine::translate(-attachment_point.select(layout_size));
+
+                        draw_layout(scene, transform * placement_transform, &l, fill_paint);
+                    };
                 }
             }
         }
+    }
+
+    /// Compute layouts and measures for text items in a [`RenderLayer`].
+    #[tracing::instrument(skip_all)]
+    pub fn compute_text_layouts_and_measures(
+        &mut self,
+        graphics: &GraphicsBag,
+        render_layer: &RenderLayer,
+    ) -> (LayoutCache, BTreeMap<ItemHandle, (DirectIsometry, Size)>) {
+        let mut layouts = BTreeMap::new();
+        let mut measures = BTreeMap::new();
+
+        let font_cx = &mut self.font_cx;
+        let layout_cx = &mut self.layout_cx;
+
+        for idx in &render_layer.indices {
+            let GraphicsItem::FatText(FatText {
+                text,
+                style,
+                max_inline_size,
+                alignment,
+                insertion,
+                attachment_point,
+                ..
+            }) = graphics.get(*idx)
+            else {
+                continue;
+            };
+
+            let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, false);
+            for prop in style.inner().values() {
+                builder.push_default(prop.to_owned());
+            }
+            let mut layout = builder.build(text);
+            layout.break_all_lines(*max_inline_size);
+            layout.align(*max_inline_size, *alignment, Default::default());
+
+            let layout_size = Size {
+                width: max_inline_size.unwrap_or(layout.width()) as f64,
+                height: layout.height() as f64,
+            };
+
+            let rotated_offset = rotate_offset(*attachment_point, layout_size, insertion.angle);
+
+            measures.insert(
+                *idx,
+                (
+                    DirectIsometry {
+                        displacement: insertion.displacement - rotated_offset,
+                        ..*insertion
+                    },
+                    layout_size,
+                ),
+            );
+
+            layouts.insert(*idx, layout);
+        }
+
+        (layouts, measures)
     }
 
     /// Measure text items in a [`RenderLayer`].
@@ -206,6 +237,61 @@ impl Environment {
         }
 
         out
+    }
+}
+
+/// Draw a layout to a scene.
+fn draw_layout(
+    scene: &mut Scene,
+    transform: Affine,
+    layout: &Layout<Option<Color>>,
+    fill_paint: &Brush,
+) {
+    for line in layout.lines() {
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                continue;
+            };
+
+            let mut x = glyph_run.offset();
+            let y = glyph_run.baseline();
+            let run = glyph_run.run();
+
+            // Vello has a hard time drawing glyphs either very large or very
+            // small, so we render at 1000 units regardless, and then transform.
+            let fudge = run.font_size() as f64 / 1000.0;
+
+            let synthesis = run.synthesis();
+            scene
+                .draw_glyphs(run.font())
+                // TODO: Color will come from styled text.
+                .brush(fill_paint)
+                .hint(false)
+                .transform(transform)
+                .glyph_transform(Some(if let Some(angle) = synthesis.skew() {
+                    Affine::scale(fudge) * Affine::skew(angle.to_radians().tan() as f64, 0.0)
+                } else {
+                    Affine::scale(fudge)
+                }))
+                // Small font sizes are quantized, multiplying by
+                // 50 and then scaling by 1 / 50 at the glyph level
+                // works around this, but it is a hack.
+                .font_size(1000_f32)
+                .normalized_coords(run.normalized_coords())
+                .draw(
+                    Fill::NonZero,
+                    glyph_run.glyphs().map(|g| {
+                        let gx = x + g.x;
+                        let gy = y - g.y;
+                        x += g.advance;
+                        vello::Glyph {
+                            id: g.id,
+                            x: gx,
+                            y: gy,
+                        }
+                    }),
+                );
+        }
     }
 }
 
