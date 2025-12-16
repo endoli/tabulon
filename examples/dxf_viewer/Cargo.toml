@@ -12,16 +12,16 @@ tracing-tracy = ["dep:tracing-tracy", "dep:tracy-client"]
 tracing-tracy-memory = ["tracing-tracy"]
 
 [dependencies]
-anyhow = "1.0.93"
-joto_constants = "0.1.1"
-pollster = "0.4.0"
+anyhow = "1.0.98"
+joto_constants = "0.2.0"
+pollster = "0.4"
 tracing-subscriber.workspace = true
 tracing-tracy = { workspace = true, optional = true }
 tracing.workspace = true
 tracy-client = { workspace = true, optional = true }
-ui-events = "0.2.0"
-ui-events-winit = "0.2.0"
-vello = "0.6.0"
+ui-events = "0.3.0"
+ui-events-winit = "0.3.0"
+vello = "0.7.0"
 winit = { version = "0.30.10", default-features = false }
 dpi = "0.1.2"
 
