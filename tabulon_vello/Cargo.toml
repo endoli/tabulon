@@ -15,7 +15,7 @@ libm = ["parley/libm", "tabulon/libm"]
 [dependencies]
 parley = { workspace = true }
 tracing = { workspace = true }
-vello = "0.6.0"
+vello = "0.7.0"
 
 tabulon = { workspace = true }
 

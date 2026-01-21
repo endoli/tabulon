@@ -24,7 +24,7 @@ use tabulon::{
     text::{AttachmentPoint, FatText},
 };
 
-use joto_constants::u64::MICROMETER;
+use joto_constants::length::u64::MICROMETER;
 use parley::{Alignment, LineHeight, StyleSet};
 
 extern crate alloc;
@@ -753,7 +753,7 @@ impl DrawingInfo {
 /// Adapt line weights to [`FatPaint`] strokes for rendering.
 #[derive(Debug, Clone, Copy)]
 pub struct RestrokePaint {
-    /// Physical line weight expressed in [iota][`joto_constants::u64::IOTA`].
+    /// Physical line weight expressed in [iota][`joto_constants::length::u64::IOTA`].
     pub weight: u64,
     /// The target [`PaintHandle`].
     pub handle: PaintHandle,
@@ -775,7 +775,7 @@ impl RestrokePaint {
     /// For reference, see the [AutoCAD documentation for line weights][0].
     ///
     /// * `graphics` — the [`GraphicsBag`] that contains the paints to be updated.
-    /// * `pitch` — Physical pitch of a 1.0 stroke, generally 1 display pixel, in [iota][`joto_constants::u64::IOTA`].
+    /// * `pitch` — Physical pitch of a 1.0 stroke, generally 1 display pixel, in [iota][`joto_constants::length::u64::IOTA`].
     /// * `view_scale` — uniform scale of the drawing view transform.
     /// * `min_stroke` — minimum stroke width, typically 1 device pixel.
     /// * `max_stroke` — maximum stroke width, useful for plotters.

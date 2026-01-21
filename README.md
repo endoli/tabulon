@@ -17,7 +17,7 @@ The Tabulon library provides functionality for working with canvas-like scenes.
 
 ## Minimum supported Rust Version (MSRV)
 
-This version of Tabulon has been verified to compile with **Rust 1.86** and later.
+This version of Tabulon has been verified to compile with **Rust 1.88** and later.
 
 Future versions of Tabulon might increase the Rust version requirement.
 It will not be treated as a breaking change and as such can even happen with small patch releases.

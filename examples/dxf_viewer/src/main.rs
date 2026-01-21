@@ -35,7 +35,7 @@
 
 use anyhow::Result;
 use dpi::PhysicalPosition;
-use joto_constants::u64::{INCH, MICROMETER};
+use joto_constants::length::u64::{INCH, MICROMETER};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -329,60 +329,37 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                 is_synthetic: true,
                 ..
             }
-        ) {
-            if let Some(wet) = self.event_reducer.reduce(scale_factor, &event) {
-                match wet {
-                    WindowEventTranslation::Keyboard(k) => {
-                        use ui_events::keyboard::{Key, NamedKey};
-                        if k.state.is_down() && matches!(k.key, Key::Named(NamedKey::Escape)) {
-                            event_loop.exit();
-                        }
+        ) && let Some(wet) = self.event_reducer.reduce(scale_factor, &event)
+        {
+            match wet {
+                WindowEventTranslation::Keyboard(k) => {
+                    use ui_events::keyboard::{Key, NamedKey};
+                    if k.state.is_down() && matches!(k.key, Key::Named(NamedKey::Escape)) {
+                        event_loop.exit();
                     }
-                    WindowEventTranslation::Pointer(p) => {
-                        let Some(viewer) = &mut self.viewer else {
-                            return;
-                        };
+                }
+                WindowEventTranslation::Pointer(p) => {
+                    let Some(viewer) = &mut self.viewer else {
+                        return;
+                    };
 
-                        match p {
-                            PointerEvent::Down(
-                                PointerButtonEvent {
-                                    pointer:
-                                        PointerInfo {
-                                            pointer_id,
-                                            pointer_type: PointerType::Mouse,
-                                            ..
-                                        },
-                                    button: Some(PointerButton::Primary),
-                                    state:
-                                        PointerState {
-                                            position: PhysicalPosition { x, y },
-                                            ..
-                                        },
-                                }
-                                | PointerButtonEvent {
-                                    pointer:
-                                        PointerInfo {
-                                            pointer_id,
-                                            pointer_type: PointerType::Touch,
-                                            ..
-                                        },
-                                    state:
-                                        PointerState {
-                                            position: PhysicalPosition { x, y },
-                                            count: 1,
-                                            ..
-                                        },
-                                    ..
-                                },
-                            ) => {
-                                if let GestureState::Hover = viewer.gestures {
-                                    viewer.gestures = GestureState::Pan {
+                    match p {
+                        PointerEvent::Down(
+                            PointerButtonEvent {
+                                pointer:
+                                    PointerInfo {
                                         pointer_id,
-                                        pos: Point { x, y },
-                                    };
-                                }
+                                        pointer_type: PointerType::Mouse,
+                                        ..
+                                    },
+                                button: Some(PointerButton::Primary),
+                                state:
+                                    PointerState {
+                                        position: PhysicalPosition { x, y },
+                                        ..
+                                    },
                             }
-                            PointerEvent::Down(PointerButtonEvent {
+                            | PointerButtonEvent {
                                 pointer:
                                     PointerInfo {
                                         pointer_id,
@@ -392,180 +369,200 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                 state:
                                     PointerState {
                                         position: PhysicalPosition { x, y },
-                                        count: 2,
+                                        count: 1,
                                         ..
                                     },
                                 ..
-                            }) => {
-                                if let GestureState::Hover = viewer.gestures {
-                                    viewer.gestures = GestureState::DragZoomAbout {
-                                        pointer_id,
-                                        about: Point { x, y },
-                                        y,
-                                    }
-                                }
-                            }
-                            PointerEvent::Down(PointerButtonEvent {
-                                pointer:
-                                    PointerInfo {
-                                        pointer_id,
-                                        pointer_type: PointerType::Mouse,
-                                        ..
-                                    },
-                                button: Some(PointerButton::Auxiliary),
-                                state:
-                                    PointerState {
-                                        position: PhysicalPosition { x, y },
-                                        ..
-                                    },
-                            }) => {
-                                if let GestureState::Hover = viewer.gestures {
-                                    viewer.gestures = GestureState::DragZoomAbout {
-                                        pointer_id,
-                                        about: Point { x, y },
-                                        y,
-                                    }
-                                }
-                            }
-                            PointerEvent::Down(PointerButtonEvent {
-                                pointer:
-                                    PointerInfo {
-                                        pointer_id,
-                                        pointer_type: PointerType::Mouse,
-                                        ..
-                                    },
-                                button: Some(PointerButton::Secondary),
-                                state:
-                                    PointerState {
-                                        position: PhysicalPosition { y, .. },
-                                        ..
-                                    },
-                            }) => {
-                                if let GestureState::Hover = viewer.gestures {
-                                    viewer.gestures = GestureState::DragZoomAbout {
-                                        pointer_id,
-                                        about: center,
-                                        y,
-                                    }
-                                }
-                            }
-                            PointerEvent::Move(PointerUpdate {
-                                pointer: PointerInfo { pointer_id, .. },
-                                current:
-                                    PointerState {
-                                        position: PhysicalPosition { x, y },
-                                        ..
-                                    },
-                                ..
-                            }) => {
-                                let p = Point { x, y };
-                                let dp = viewer.view_transform.inverse() * p;
-
-                                match &mut viewer.gestures {
-                                    GestureState::Pan {
-                                        pointer_id: g_pointer,
-                                        pos,
-                                    } if *g_pointer == pointer_id => {
-                                        viewer.view_transform =
-                                            viewer.view_transform.then_translate(-(*pos - p));
-                                        reproject = true;
-                                        *pos = p;
-                                    }
-                                    GestureState::DragZoomAbout {
-                                        pointer_id: g_pointer,
-                                        about,
-                                        y,
-                                    } if *g_pointer == pointer_id => {
-                                        let sd = 1. + (p.y - *y) * (400.0 * scale_factor).recip();
-                                        viewer.view_transform =
-                                            viewer.view_transform.then_scale_about(sd, *about);
-                                        viewer.view_scale *= sd;
-                                        reproject = true;
-                                        *y = p.y;
-                                    }
-                                    GestureState::Hover
-                                        if pointer_id == Some(PointerId::PRIMARY) =>
-                                    {
-                                        let pick_dist: f64 = window.scale_factor() * 1.414;
-                                        let pick_started = Instant::now();
-
-                                        let pick = viewer
-                                            .picking_index
-                                            .pick(dp, pick_dist * viewer.view_scale.recip());
-
-                                        if viewer.pick != pick {
-                                            if let Some(pick) = pick {
-                                                let pick_duration = Instant::now()
-                                                    .saturating_duration_since(pick_started);
-                                                eprintln!(
-                                                    "{:#?}",
-                                                    viewer.td.info.get_entity(pick).specific
-                                                );
-                                                eprintln!("Pick took {pick_duration:?}");
-                                            }
-                                            viewer.pick = pick;
-                                            reproject = true;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            PointerEvent::Up(PointerButtonEvent {
-                                pointer: PointerInfo { pointer_id, .. },
-                                ..
-                            })
-                            | PointerEvent::Cancel(PointerInfo { pointer_id, .. }) => {
-                                match viewer.gestures {
-                                    GestureState::Pan {
-                                        pointer_id: g_pointer,
-                                        ..
-                                    }
-                                    | GestureState::DragZoomAbout {
-                                        pointer_id: g_pointer,
-                                        ..
-                                    } if g_pointer == pointer_id => {
-                                        viewer.gestures = GestureState::Hover;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            PointerEvent::Scroll(PointerScrollEvent {
-                                delta,
-                                state:
-                                    PointerState {
-                                        position: PhysicalPosition { x, y },
-                                        ..
-                                    },
-                                ..
-                            }) => {
-                                let d = match delta {
-                                    ScrollDelta::LineDelta(_, y) => y as f64 * 0.1,
-                                    ScrollDelta::PixelDelta(pd) => pd.y * 0.05,
-                                    _ => 0.,
+                            },
+                        ) => {
+                            if let GestureState::Hover = viewer.gestures {
+                                viewer.gestures = GestureState::Pan {
+                                    pointer_id,
+                                    pos: Point { x, y },
                                 };
-                                viewer.view_transform = viewer
-                                    .view_transform
-                                    .then_scale_about(1. + d, Point { x, y });
-                                viewer.view_scale *= 1. + d;
-                                reproject = true;
                             }
-                            PointerEvent::Gesture(PointerGestureEvent {
-                                gesture: PointerGesture::Pinch(d),
-                                state:
-                                    PointerState {
-                                        position: PhysicalPosition { x, y },
-                                        ..
-                                    },
-                                ..
-                            }) => {
-                                viewer.view_transform = viewer
-                                    .view_transform
-                                    .then_scale_about(1. + d as f64, Point { x, y });
-                                viewer.view_scale *= 1. + d as f64;
-                                reproject = true;
-                            }
-                            _ => {}
                         }
+                        PointerEvent::Down(PointerButtonEvent {
+                            pointer:
+                                PointerInfo {
+                                    pointer_id,
+                                    pointer_type: PointerType::Touch,
+                                    ..
+                                },
+                            state:
+                                PointerState {
+                                    position: PhysicalPosition { x, y },
+                                    count: 2,
+                                    ..
+                                },
+                            ..
+                        }) => {
+                            if let GestureState::Hover = viewer.gestures {
+                                viewer.gestures = GestureState::DragZoomAbout {
+                                    pointer_id,
+                                    about: Point { x, y },
+                                    y,
+                                }
+                            }
+                        }
+                        PointerEvent::Down(PointerButtonEvent {
+                            pointer:
+                                PointerInfo {
+                                    pointer_id,
+                                    pointer_type: PointerType::Mouse,
+                                    ..
+                                },
+                            button: Some(PointerButton::Auxiliary),
+                            state:
+                                PointerState {
+                                    position: PhysicalPosition { x, y },
+                                    ..
+                                },
+                        }) => {
+                            if let GestureState::Hover = viewer.gestures {
+                                viewer.gestures = GestureState::DragZoomAbout {
+                                    pointer_id,
+                                    about: Point { x, y },
+                                    y,
+                                }
+                            }
+                        }
+                        PointerEvent::Down(PointerButtonEvent {
+                            pointer:
+                                PointerInfo {
+                                    pointer_id,
+                                    pointer_type: PointerType::Mouse,
+                                    ..
+                                },
+                            button: Some(PointerButton::Secondary),
+                            state:
+                                PointerState {
+                                    position: PhysicalPosition { y, .. },
+                                    ..
+                                },
+                        }) => {
+                            if let GestureState::Hover = viewer.gestures {
+                                viewer.gestures = GestureState::DragZoomAbout {
+                                    pointer_id,
+                                    about: center,
+                                    y,
+                                }
+                            }
+                        }
+                        PointerEvent::Move(PointerUpdate {
+                            pointer: PointerInfo { pointer_id, .. },
+                            current:
+                                PointerState {
+                                    position: PhysicalPosition { x, y },
+                                    ..
+                                },
+                            ..
+                        }) => {
+                            let p = Point { x, y };
+                            let dp = viewer.view_transform.inverse() * p;
+
+                            match &mut viewer.gestures {
+                                GestureState::Pan {
+                                    pointer_id: g_pointer,
+                                    pos,
+                                } if *g_pointer == pointer_id => {
+                                    viewer.view_transform =
+                                        viewer.view_transform.then_translate(-(*pos - p));
+                                    reproject = true;
+                                    *pos = p;
+                                }
+                                GestureState::DragZoomAbout {
+                                    pointer_id: g_pointer,
+                                    about,
+                                    y,
+                                } if *g_pointer == pointer_id => {
+                                    let sd = 1. + (p.y - *y) * (400.0 * scale_factor).recip();
+                                    viewer.view_transform =
+                                        viewer.view_transform.then_scale_about(sd, *about);
+                                    viewer.view_scale *= sd;
+                                    reproject = true;
+                                    *y = p.y;
+                                }
+                                GestureState::Hover if pointer_id == Some(PointerId::PRIMARY) => {
+                                    let pick_dist: f64 = window.scale_factor() * 1.414;
+                                    let pick_started = Instant::now();
+
+                                    let pick = viewer
+                                        .picking_index
+                                        .pick(dp, pick_dist * viewer.view_scale.recip());
+
+                                    if viewer.pick != pick {
+                                        if let Some(pick) = pick {
+                                            let pick_duration = Instant::now()
+                                                .saturating_duration_since(pick_started);
+                                            eprintln!(
+                                                "{:#?}",
+                                                viewer.td.info.get_entity(pick).specific
+                                            );
+                                            eprintln!("Pick took {pick_duration:?}");
+                                        }
+                                        viewer.pick = pick;
+                                        reproject = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        PointerEvent::Up(PointerButtonEvent {
+                            pointer: PointerInfo { pointer_id, .. },
+                            ..
+                        })
+                        | PointerEvent::Cancel(PointerInfo { pointer_id, .. }) => {
+                            match viewer.gestures {
+                                GestureState::Pan {
+                                    pointer_id: g_pointer,
+                                    ..
+                                }
+                                | GestureState::DragZoomAbout {
+                                    pointer_id: g_pointer,
+                                    ..
+                                } if g_pointer == pointer_id => {
+                                    viewer.gestures = GestureState::Hover;
+                                }
+                                _ => {}
+                            }
+                        }
+                        PointerEvent::Scroll(PointerScrollEvent {
+                            delta,
+                            state:
+                                PointerState {
+                                    position: PhysicalPosition { x, y },
+                                    ..
+                                },
+                            ..
+                        }) => {
+                            let d = match delta {
+                                ScrollDelta::LineDelta(_, y) => y as f64 * 0.1,
+                                ScrollDelta::PixelDelta(pd) => pd.y * 0.05,
+                                _ => 0.,
+                            };
+                            viewer.view_transform = viewer
+                                .view_transform
+                                .then_scale_about(1. + d, Point { x, y });
+                            viewer.view_scale *= 1. + d;
+                            reproject = true;
+                        }
+                        PointerEvent::Gesture(PointerGestureEvent {
+                            gesture: PointerGesture::Pinch(d),
+                            state:
+                                PointerState {
+                                    position: PhysicalPosition { x, y },
+                                    ..
+                                },
+                            ..
+                        }) => {
+                            viewer.view_transform = viewer
+                                .view_transform
+                                .then_scale_about(1. + d as f64, Point { x, y });
+                            viewer.view_scale *= 1. + d as f64;
+                            reproject = true;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -702,10 +699,10 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
 
                 let _ = device_handle.device.poll(wgpu::PollType::Poll);
 
-                if let Some(viewer) = &self.viewer {
-                    if viewer.defer_reprojection {
-                        reproject_deferred = true;
-                    }
+                if let Some(viewer) = &self.viewer
+                    && viewer.defer_reprojection
+                {
+                    reproject_deferred = true;
                 };
             }
             _ => {}

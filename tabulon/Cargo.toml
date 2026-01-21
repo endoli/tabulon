@@ -21,7 +21,7 @@ std = ["peniko/std", "parley/std", "tracing/std"]
 libm = ["dep:libm", "peniko/libm", "parley/libm"]
 
 [dependencies]
-peniko = { version = "0.5.0", default-features = false }
+peniko = { version = "0.6.0", default-features = false }
 parley = { workspace = true }
 tracing = { workspace = true }
 
