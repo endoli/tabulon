@@ -5,6 +5,7 @@ members = [
     "tabulon_dxf",
     "tabulon_vello",
     "examples/dxf_viewer",
+    "examples/dxf_to_svg",
     "examples/vello_simple",
 ]
 

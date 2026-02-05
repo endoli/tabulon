@@ -489,6 +489,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dxf_to_svg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "joto_constants",
+ "parley",
+ "tabulon",
+ "tabulon_dxf",
+]
+
+[[package]]
 name = "dxf_viewer"
 version = "0.1.0"
 dependencies = [
