@@ -1651,6 +1651,24 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                 if !lines.is_empty() {
                     chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, lines));
                 }
+
+                // Apply base point offset so INSERT location aligns with `base_point`.
+                let block_base = point_from_dxf_point(&b.base_point).to_vec2();
+                if block_base != Vec2::ZERO {
+                    let base_transform = Affine::translate(-block_base);
+                    for chunk in chunks.iter_mut() {
+                        match chunk {
+                            BlockChunk::Path(_, _, path) => {
+                                path.apply_affine(base_transform);
+                            }
+                            BlockChunk::Text(_, ti) => {
+                                ti.insertion.displacement -= block_base;
+                            }
+                            BlockChunk::Unsupported => {}
+                        }
+                    }
+                }
+
                 there_is_absolutely_no_hope = false;
                 blocks.insert(b.name.as_str(), chunks);
             }
@@ -2116,6 +2134,61 @@ mod tests {
             &*decode_dxf_mtext_value("Esc: \\\\ \\{ \\} \\~", empty),
             "Esc: \\ { }  "
         );
+    }
+
+    #[test]
+    fn insert_applies_block_base_point_offset() {
+        let mut drawing = Drawing::new();
+
+        let block = dxf::Block {
+            name: "B".to_owned(),
+            layer: "0".to_owned(),
+            base_point: dxf::Point::new(100.0, 100.0, 0.0),
+            entities: vec![dxf::entities::Entity::new(EntityType::Line(
+                dxf::entities::Line::new(
+                    dxf::Point::new(100.0, 100.0, 0.0),
+                    dxf::Point::new(110.0, 100.0, 0.0),
+                ),
+            ))],
+            ..Default::default()
+        };
+        drawing.add_block(block);
+
+        let ins = dxf::entities::Insert {
+            name: "B".to_owned(),
+            location: dxf::Point::new(0.0, 0.0, 0.0),
+            ..Default::default()
+        };
+        drawing.add_entity(dxf::entities::Entity::new(EntityType::Insert(ins)));
+
+        let td = load_drawing_default_layers(drawing).expect("drawing should translate");
+
+        let mut found = false;
+        for ih in td.item_entity_map.keys() {
+            let GraphicsItem::FatShape(FatShape { path, .. }) = td.graphics.get(*ih) else {
+                continue;
+            };
+            let els = path.elements();
+            let Some(PathEl::MoveTo(p0)) = els.first().copied() else {
+                continue;
+            };
+            let Some(PathEl::LineTo(p1)) = els.get(1).copied() else {
+                continue;
+            };
+
+            // Note: tabulon_dxf flips Y on import; subtracting base_point should still land at 0.
+            let eps = 1e-9;
+            if (p0.x - 0.0).abs() < eps
+                && (p0.y - 0.0).abs() < eps
+                && (p1.x - 10.0).abs() < eps
+                && (p1.y - 0.0).abs() < eps
+            {
+                found = true;
+                break;
+            }
+        }
+
+        assert!(found, "expected line moved by block base_point offset");
     }
 
     #[test]
