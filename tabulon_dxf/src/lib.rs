@@ -71,6 +71,258 @@ enum BlockChunk {
     Text(i16, TextItem),
 }
 
+fn decode_dxf_text_value(text: &str) -> String {
+    text.replace("%%c", "∅")
+        .replace("%%d", "°")
+        .replace("%%p", "±")
+        .replace("%%C", "∅")
+        .replace("%%D", "°")
+        .replace("%%P", "±")
+        .replace("%%%", "%")
+        // TODO: implement toggle underline with styled text.
+        .replace("%%u", "")
+        // TODO: implement toggle overline with styled text.
+        .replace("%%o", "")
+}
+
+fn decode_dxf_mtext_value(text: &str, extended_text: &[String]) -> String {
+    let mut combined = text.to_owned();
+    for ext in extended_text.iter() {
+        combined.push_str(ext);
+    }
+
+    // TODO: Implement a shared parser for scanning formatting codes into styled text
+    //       and doing unicode substitution for special character codes.
+    // TODO: Implement start/stop underline/overline/strikethrough with styled text.
+    combined
+        .replace("%%c", "∅")
+        .replace("%%d", "°")
+        .replace("%%p", "±")
+        .replace("%%C", "∅")
+        .replace("%%D", "°")
+        .replace("%%P", "±")
+        .replace("%%%", "%")
+        .replace("\\L", "")
+        .replace("\\l", "")
+        .replace("\\O", "")
+        .replace("\\o", "")
+        .replace("\\S", "")
+        .replace("\\s", "")
+        .replace("\\P", "\n")
+        .replace("\\A1;", "")
+        .replace("\\A0;", "")
+        .replace("\\pxqc;", "")
+        .replace("\\pxql;", "")
+        .replace("\\pxqr;", "")
+}
+
+#[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
+fn style_for_text_height(
+    styles: &BTreeMap<&str, StyleSet<Option<Color>>>,
+    style_name: &str,
+    text_height: f64,
+    oblique_angle: f64,
+) -> StyleSet<Option<Color>> {
+    let mut style = styles.get(style_name).map_or_else(
+        || StyleSet::new(text_height as f32),
+        |s| {
+            if style_size_is_zero(s) {
+                let mut news = s.clone();
+                news.insert(StyleProperty::FontSize(text_height as f32));
+                news
+            } else {
+                s.clone()
+            }
+        },
+    );
+    if oblique_angle != 0.0 {
+        style.insert(StyleProperty::FontStyle(FontStyle::Oblique(Some(
+            oblique_angle as f32,
+        ))));
+    }
+    style
+}
+
+fn text_item_from_attribute(
+    a: &dxf::entities::Attribute,
+    styles: &BTreeMap<&str, StyleSet<Option<Color>>>,
+) -> Option<TextItem> {
+    // FIXME: currently only support viewing from +Z.
+    if a.normal.z != 1.0 || a.is_invisible() {
+        return None;
+    }
+
+    let text = if a.value.is_empty()
+        && (!a.m_text.text.is_empty() || !a.m_text.extended_text.is_empty())
+    {
+        decode_dxf_mtext_value(&a.m_text.text, &a.m_text.extended_text)
+    } else {
+        decode_dxf_text_value(&a.value)
+    };
+
+    let attachment_point = {
+        use HorizontalTextJustification as H;
+        use VerticalTextJustification as V;
+        match (
+            a.horizontal_text_justification,
+            a.vertical_text_justification,
+        ) {
+            (H::Left, V::Top) => AttachmentPoint::TopLeft,
+            (H::Center | H::Middle, V::Top) => AttachmentPoint::TopCenter,
+            (H::Right, V::Top) => AttachmentPoint::TopRight,
+            (H::Left, V::Middle) => AttachmentPoint::MiddleLeft,
+            (H::Center | H::Middle, V::Middle) => AttachmentPoint::MiddleCenter,
+            (H::Right, V::Middle) => AttachmentPoint::MiddleRight,
+            (H::Left, V::Bottom) => AttachmentPoint::BottomLeft,
+            (H::Center | H::Middle, V::Bottom) => AttachmentPoint::BottomCenter,
+            (H::Right, V::Bottom) => AttachmentPoint::BottomRight,
+            (H::Left, V::Baseline) => AttachmentPoint::BottomLeft,
+            (H::Center | H::Middle, V::Baseline) => AttachmentPoint::BottomCenter,
+            (H::Right, V::Baseline) => AttachmentPoint::BottomRight,
+            // These need further attention.
+            (H::Aligned | H::Fit, V::Top) => AttachmentPoint::TopLeft,
+            (H::Aligned | H::Fit, V::Middle) => AttachmentPoint::MiddleLeft,
+            (H::Aligned | H::Fit, V::Bottom | V::Baseline) => AttachmentPoint::BottomLeft,
+        }
+    };
+
+    let alignment = {
+        use HorizontalTextJustification::*;
+        match a.horizontal_text_justification {
+            Left => Alignment::Left,
+            Right => Alignment::Right,
+            Center | Middle => Alignment::Center,
+            // These need further attention.
+            Aligned | Fit => Alignment::Left,
+        }
+    };
+
+    let angle = {
+        use HorizontalTextJustification as H;
+        match a.horizontal_text_justification {
+            H::Aligned | H::Fit => (point_from_dxf_point(&a.second_alignment_point).to_vec2()
+                - point_from_dxf_point(&a.location).to_vec2())
+            .angle(),
+            _ => -a.rotation.to_radians(),
+        }
+    };
+
+    let displacement = {
+        use HorizontalTextJustification as H;
+        match a.horizontal_text_justification {
+            H::Center => point_from_dxf_point(&a.second_alignment_point).to_vec2(),
+            _ => point_from_dxf_point(&a.location).to_vec2(),
+        }
+    };
+
+    Some(TextItem {
+        text: text.into(),
+        style: style_for_text_height(
+            styles,
+            a.text_style_name.as_str(),
+            a.text_height,
+            a.oblique_angle,
+        ),
+        alignment,
+        insertion: DirectIsometry {
+            angle,
+            displacement,
+        },
+        max_inline_size: None,
+        attachment_point,
+    })
+}
+
+fn text_item_from_attribute_definition(
+    a: &dxf::entities::AttributeDefinition,
+    styles: &BTreeMap<&str, StyleSet<Option<Color>>>,
+) -> Option<TextItem> {
+    // FIXME: currently only support viewing from +Z.
+    if a.normal.z != 1.0 || a.is_invisible() {
+        return None;
+    }
+
+    let text = if a.value.is_empty()
+        && (!a.m_text.text.is_empty() || !a.m_text.extended_text.is_empty())
+    {
+        decode_dxf_mtext_value(&a.m_text.text, &a.m_text.extended_text)
+    } else {
+        decode_dxf_text_value(&a.value)
+    };
+
+    let attachment_point = {
+        use HorizontalTextJustification as H;
+        use VerticalTextJustification as V;
+        match (
+            a.horizontal_text_justification,
+            a.vertical_text_justification,
+        ) {
+            (H::Left, V::Top) => AttachmentPoint::TopLeft,
+            (H::Center | H::Middle, V::Top) => AttachmentPoint::TopCenter,
+            (H::Right, V::Top) => AttachmentPoint::TopRight,
+            (H::Left, V::Middle) => AttachmentPoint::MiddleLeft,
+            (H::Center | H::Middle, V::Middle) => AttachmentPoint::MiddleCenter,
+            (H::Right, V::Middle) => AttachmentPoint::MiddleRight,
+            (H::Left, V::Bottom) => AttachmentPoint::BottomLeft,
+            (H::Center | H::Middle, V::Bottom) => AttachmentPoint::BottomCenter,
+            (H::Right, V::Bottom) => AttachmentPoint::BottomRight,
+            (H::Left, V::Baseline) => AttachmentPoint::BottomLeft,
+            (H::Center | H::Middle, V::Baseline) => AttachmentPoint::BottomCenter,
+            (H::Right, V::Baseline) => AttachmentPoint::BottomRight,
+            // These need further attention.
+            (H::Aligned | H::Fit, V::Top) => AttachmentPoint::TopLeft,
+            (H::Aligned | H::Fit, V::Middle) => AttachmentPoint::MiddleLeft,
+            (H::Aligned | H::Fit, V::Bottom | V::Baseline) => AttachmentPoint::BottomLeft,
+        }
+    };
+
+    let alignment = {
+        use HorizontalTextJustification::*;
+        match a.horizontal_text_justification {
+            Left => Alignment::Left,
+            Right => Alignment::Right,
+            Center | Middle => Alignment::Center,
+            // These need further attention.
+            Aligned | Fit => Alignment::Left,
+        }
+    };
+
+    let angle = {
+        use HorizontalTextJustification as H;
+        match a.horizontal_text_justification {
+            H::Aligned | H::Fit => (point_from_dxf_point(&a.second_alignment_point).to_vec2()
+                - point_from_dxf_point(&a.location).to_vec2())
+            .angle(),
+            _ => -a.rotation.to_radians(),
+        }
+    };
+
+    let displacement = {
+        use HorizontalTextJustification as H;
+        match a.horizontal_text_justification {
+            H::Center => point_from_dxf_point(&a.second_alignment_point).to_vec2(),
+            _ => point_from_dxf_point(&a.location).to_vec2(),
+        }
+    };
+
+    Some(TextItem {
+        text: text.into(),
+        style: style_for_text_height(
+            styles,
+            a.text_style_name.as_str(),
+            a.text_height,
+            a.oblique_angle,
+        ),
+        alignment,
+        insertion: DirectIsometry {
+            angle,
+            displacement,
+        },
+        max_inline_size: None,
+        attachment_point,
+    })
+}
+
 /// Convert an entity to a [`BlockChunk`].
 fn chunk_from_entity(
     e: &dxf::entities::Entity,
@@ -91,36 +343,7 @@ fn chunk_from_entity(
             // TODO: Handle columns.
             // TODO: Handle paragraph styles.
             // TODO: Handle rotation.
-            let mut nt = mt.text.clone();
-            for ext in mt.extended_text.iter() {
-                nt.push_str(ext);
-            }
-
-            // TODO: Implement a shared parser for scanning formatting codes into styled text
-            //       and doing unicode substitution for special character codes.
-            let nt = nt
-                .replace("%%c", "∅")
-                .replace("%%d", "°")
-                .replace("%%p", "±")
-                .replace("%%C", "∅")
-                .replace("%%D", "°")
-                .replace("%%P", "±")
-                .replace("%%%", "%")
-                // TODO: Implement start/stop underline with styled text.
-                .replace("\\L", "")
-                .replace("\\l", "")
-                // TODO: Implement start/stop overline with styled text.
-                .replace("\\O", "")
-                .replace("\\o", "")
-                // TODO: Implement start/stop strikethrough with styled text.
-                .replace("\\S", "")
-                .replace("\\s", "")
-                .replace("\\P", "\n")
-                .replace("\\A1;", "")
-                .replace("\\A0;", "")
-                .replace("\\pxqc;", "")
-                .replace("\\pxql;", "")
-                .replace("\\pxqr;", "");
+            let nt = decode_dxf_mtext_value(&mt.text, &mt.extended_text);
 
             let x_angle = Vec2 {
                 x: mt.x_axis_direction.x,
@@ -192,19 +415,7 @@ fn chunk_from_entity(
 
             // TODO: Implement a shared parser for scanning formatting codes into styled text
             //       and doing unicode substitution for special character codes.
-            let text = t
-                .value
-                .replace("%%c", "∅")
-                .replace("%%d", "°")
-                .replace("%%p", "±")
-                .replace("%%C", "∅")
-                .replace("%%D", "°")
-                .replace("%%P", "±")
-                .replace("%%%", "%")
-                // TODO: implement toggle underline with styled text.
-                .replace("%%u", "")
-                // TODO: implement toggle overline with styled text.
-                .replace("%%o", "");
+            let text = decode_dxf_text_value(&t.value);
 
             let attachment_point = {
                 use HorizontalTextJustification as H;
@@ -266,23 +477,11 @@ fn chunk_from_entity(
                 ce,
                 TextItem {
                     text: text.into(),
-                    style: styles.get(t.text_style_name.as_str()).map_or_else(
-                        || StyleSet::new(t.text_height as f32),
-                        |s| {
-                            let mut sized = if style_size_is_zero(s) {
-                                let mut news = s.clone();
-                                news.insert(StyleProperty::FontSize(t.text_height as f32));
-                                news
-                            } else {
-                                s.clone()
-                            };
-                            if t.oblique_angle != 0.0 {
-                                sized.insert(StyleProperty::FontStyle(FontStyle::Oblique(Some(
-                                    t.oblique_angle as f32,
-                                ))));
-                            }
-                            sized
-                        },
+                    style: style_for_text_height(
+                        styles,
+                        t.text_style_name.as_str(),
+                        t.text_height,
+                        t.oblique_angle,
                     ),
                     alignment,
                     insertion: DirectIsometry {
@@ -294,6 +493,12 @@ fn chunk_from_entity(
                 },
             )
         }
+        EntityType::Attribute(ref a) => text_item_from_attribute(a, styles)
+            .map(|ti| BlockChunk::Text(ce, ti))
+            .unwrap_or(BlockChunk::Unsupported),
+        EntityType::AttributeDefinition(ref a) => text_item_from_attribute_definition(a, styles)
+            .map(|ti| BlockChunk::Text(ce, ti))
+            .unwrap_or(BlockChunk::Unsupported),
         _ => {
             if let Some(p) = path_from_entity(e) {
                 BlockChunk::Path(
@@ -855,6 +1060,13 @@ fn recover_color_enum(c: &dxf::Color) -> i16 {
 #[cfg(feature = "std")]
 #[tracing::instrument(skip_all)]
 pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> {
+    let drawing = Drawing::load_file(path)?;
+    load_drawing_default_layers(drawing)
+}
+
+/// Translate a loaded [`Drawing`] into a [`TDDrawing`].
+#[tracing::instrument(skip_all)]
+pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
     let mut gb = GraphicsBag::default();
     let mut rl = RenderLayer::default();
     let mut item_entity_map = BTreeMap::new();
@@ -867,8 +1079,6 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
         stroke_paint: Some(Color::BLACK.into()),
         fill_paint: None,
     });
-
-    let drawing = Drawing::load_file(path)?;
 
     let visible_layers: BTreeSet<&str> = drawing
         .layers()
@@ -1204,6 +1414,13 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                                         _ => {}
                                     }
                                 }
+
+                                // Render any attribute values attached to this insert.
+                                for a in ins.attributes() {
+                                    if let Some(ti) = text_item_from_attribute(a, &styles) {
+                                        chunks.push(BlockChunk::Text(cur_style.1, ti));
+                                    }
+                                }
                                 lines = BezPath::new();
                             }
                         }
@@ -1502,6 +1719,35 @@ pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> 
                         }
                     }
                 }
+
+                // Render any attribute values attached to this insert.
+                let paint = resolve_paint(&mut gb, i16::MIN, recover_color_enum(&e.common.color));
+                for a in ins.attributes() {
+                    if let Some(TextItem {
+                        text,
+                        style,
+                        alignment,
+                        insertion,
+                        max_inline_size,
+                        attachment_point,
+                    }) = text_item_from_attribute(a, &styles)
+                    {
+                        push_item(
+                            &mut gb,
+                            FatText {
+                                transform: Default::default(),
+                                paint,
+                                text,
+                                style,
+                                alignment,
+                                insertion,
+                                max_inline_size,
+                                attachment_point,
+                            }
+                            .into(),
+                        );
+                    }
+                }
             }
             _ => match chunk_from_entity(e, &styles) {
                 BlockChunk::Path(_, _, s) => {
@@ -1631,4 +1877,66 @@ fn dxf_entity_type_name(entity_type: &EntityType) -> &str {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_attributes_render_as_text() {
+        let mut drawing = Drawing::new();
+
+        // Define a simple block.
+        let block = dxf::Block {
+            name: "Gridline Bubble".to_owned(),
+            layer: "0".to_owned(),
+            entities: vec![dxf::entities::Entity::new(EntityType::Line(
+                dxf::entities::Line::new(
+                    dxf::Point::new(0.0, 0.0, 0.0),
+                    dxf::Point::new(1.0, 0.0, 0.0),
+                ),
+            ))],
+            ..Default::default()
+        };
+        drawing.add_block(block);
+
+        // Add an insert with attributes.
+        let mut ins = dxf::entities::Insert {
+            name: "Gridline Bubble".to_owned(),
+            location: dxf::Point::new(10.0, 10.0, 0.0),
+            __has_attributes: true,
+            ..Default::default()
+        };
+
+        let a1 = dxf::entities::Attribute {
+            text_height: 15.0,
+            value: "3b".to_owned(),
+            location: dxf::Point::new(9.0, 11.0, 0.0),
+            horizontal_text_justification: HorizontalTextJustification::Center,
+            vertical_text_justification: VerticalTextJustification::Middle,
+            second_alignment_point: dxf::Point::new(10.0, 11.0, 0.0),
+            ..Default::default()
+        };
+        ins.add_attribute(&mut drawing, a1);
+
+        let a2 = dxf::entities::Attribute {
+            text_height: 7.5,
+            value: "WF".to_owned(),
+            location: dxf::Point::new(10.0, 12.0, 0.0),
+            ..Default::default()
+        };
+        ins.add_attribute(&mut drawing, a2);
+
+        drawing.add_entity(dxf::entities::Entity::new(EntityType::Insert(ins)));
+
+        let td = load_drawing_default_layers(drawing).expect("drawing should translate");
+
+        let mut texts: Vec<String> = vec![];
+        for ih in td.item_entity_map.keys() {
+            if let GraphicsItem::FatText(t) = td.graphics.get(*ih) {
+                texts.push(t.text.as_ref().to_owned());
+            }
+        }
+
+        assert!(texts.iter().any(|t| t == "3b"), "expected to find \"3b\"");
+        assert!(texts.iter().any(|t| t == "WF"), "expected to find \"WF\"");
+    }
+}
