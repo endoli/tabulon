@@ -71,49 +71,249 @@ enum BlockChunk {
     Text(i16, TextItem),
 }
 
-fn decode_dxf_text_value(text: &str) -> String {
-    text.replace("%%c", "∅")
-        .replace("%%d", "°")
-        .replace("%%p", "±")
-        .replace("%%C", "∅")
-        .replace("%%D", "°")
-        .replace("%%P", "±")
-        .replace("%%%", "%")
-        // TODO: implement toggle underline with styled text.
-        .replace("%%u", "")
-        // TODO: implement toggle overline with styled text.
-        .replace("%%o", "")
+fn parse_unicode_hex(input: &[u8]) -> Option<(char, usize)> {
+    if input.len() < 3 || input[0] != b'U' || input[1] != b'+' {
+        return None;
+    }
+    let mut j = 2;
+    while j < input.len() && input[j].is_ascii_hexdigit() {
+        j += 1;
+    }
+    if j == 2 {
+        return None;
+    }
+    let hex = core::str::from_utf8(&input[2..j]).ok()?;
+    let codepoint = u32::from_str_radix(hex, 16).ok()?;
+    let ch = char::from_u32(codepoint)?;
+    Some((ch, j))
 }
 
-fn decode_dxf_mtext_value(text: &str, extended_text: &[String]) -> String {
+fn decode_dxf_text_value(text: &str) -> sync::Arc<str> {
+    // TEXT control codes:
+    // - %%c, %%d, %%p
+    // - %%% for literal '%'
+    // - %%u (underline toggle), %%o (overline toggle), %%k (strikethrough toggle)
+    // - %%nnn for Unicode codepoint expressed as decimal
+    // See AutoCAD DXF "Control Codes" documentation.
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut out = String::with_capacity(text.len());
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if bytes.get(i + 1) == Some(&b'%') => {
+                if bytes.get(i + 2) == Some(&b'%') {
+                    out.push('%');
+                    i += 3;
+                    continue;
+                }
+                let Some(&code) = bytes.get(i + 2) else {
+                    out.push('%');
+                    out.push('%');
+                    break;
+                };
+
+                match code {
+                    b'c' | b'C' => out.push('∅'),
+                    b'd' | b'D' => out.push('°'),
+                    b'p' | b'P' => out.push('±'),
+                    b'u' | b'U' | b'o' | b'O' | b'k' | b'K' => {
+                        // formatting toggles; plain-text renderer ignores.
+                    }
+                    b' ' | b'\t' | b'\n' | b'\r' | b'0'..=b'9' => {
+                        let mut j = i + 2;
+                        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+                            j += 1;
+                        }
+                        let start = j;
+                        while j < bytes.len() && bytes[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        if start != j
+                            && let Ok(s) = core::str::from_utf8(&bytes[start..j])
+                            && let Ok(num) = s.parse::<u32>()
+                            && let Some(ch) = char::from_u32(num)
+                        {
+                            out.push(ch);
+                            i = j;
+                            continue;
+                        }
+                        // Unknown/invalid numeric control code: keep literally.
+                        out.push('%');
+                        out.push('%');
+                        i += 2;
+                        continue;
+                    }
+                    _ => {
+                        // Unknown control code: keep literally.
+                        out.push('%');
+                        out.push('%');
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 3;
+            }
+            b'\\' => {
+                // TEXT can also contain \U+XXXX (seen in the wild; common in MTEXT).
+                if let Some((ch, consumed)) = bytes.get(i + 1..).and_then(parse_unicode_hex) {
+                    out.push(ch);
+                    i += 1 + consumed;
+                } else {
+                    out.push('\\');
+                    i += 1;
+                }
+            }
+            _ => {
+                let ch = text[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out.into()
+}
+
+fn decode_dxf_mtext_value(text: &str, extended_text: &[String]) -> sync::Arc<str> {
     let mut combined = text.to_owned();
     for ext in extended_text.iter() {
         combined.push_str(ext);
     }
 
-    // TODO: Implement a shared parser for scanning formatting codes into styled text
-    //       and doing unicode substitution for special character codes.
-    // TODO: Implement start/stop underline/overline/strikethrough with styled text.
-    combined
-        .replace("%%c", "∅")
-        .replace("%%d", "°")
-        .replace("%%p", "±")
-        .replace("%%C", "∅")
-        .replace("%%D", "°")
-        .replace("%%P", "±")
-        .replace("%%%", "%")
-        .replace("\\L", "")
-        .replace("\\l", "")
-        .replace("\\O", "")
-        .replace("\\o", "")
-        .replace("\\S", "")
-        .replace("\\s", "")
-        .replace("\\P", "\n")
-        .replace("\\A1;", "")
-        .replace("\\A0;", "")
-        .replace("\\pxqc;", "")
-        .replace("\\pxql;", "")
-        .replace("\\pxqr;", "")
+    fn skip_until_semicolon(bytes: &[u8], mut i: usize) -> usize {
+        while i < bytes.len() && bytes[i] != b';' {
+            i += 1;
+        }
+        if i < bytes.len() { i + 1 } else { i }
+    }
+
+    fn has_semicolon_ahead(bytes: &[u8], i: usize) -> bool {
+        bytes.get(i..).is_some_and(|tail| tail.contains(&b';'))
+    }
+
+    fn decode_stacked_fraction(content: &str) -> String {
+        // \S<top><sep><bottom>; where sep is typically '/', '#' (diagonal), or '^' (stacked).
+        // For plain text, we emit "top/bottom" by normalizing separators.
+        content.trim().replace(['#', '^'], "/").replace("\\/", "/")
+    }
+
+    // MTEXT inline formatting codes:
+    // - \P paragraph/newline
+    // - \L/\l underline start/stop
+    // - \O/\o overline start/stop
+    // - \K/\k strikethrough start/stop
+    // - \~ non-breaking space
+    // - \S...; stacked fractions
+    // - \U+XXXX unicode codepoint
+    // - Many other formatting codes terminated by ';' (e.g. \C, \H, \W, \A, \F, \Q, \T, and \p...; variants).
+    // For now, we strip formatting and return plain text.
+    let bytes = combined.as_bytes();
+    let mut i = 0;
+    let mut out = String::with_capacity(combined.len());
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'}' => {
+                // Grouping braces: ignored for plain text.
+                i += 1;
+            }
+            b'%' if bytes.get(i + 1) == Some(&b'%') => {
+                // Reuse TEXT decoding rules for %% codes inside MTEXT.
+                // %%% is officially TEXT-only but occurs in the wild; decode to '%'.
+                if bytes.get(i + 2) == Some(&b'%') {
+                    out.push('%');
+                    i += 3;
+                    continue;
+                }
+                let Some(&code) = bytes.get(i + 2) else {
+                    out.push('%');
+                    out.push('%');
+                    break;
+                };
+                match code {
+                    b'c' | b'C' => out.push('∅'),
+                    b'd' | b'D' => out.push('°'),
+                    b'p' | b'P' => out.push('±'),
+                    b'u' | b'U' | b'o' | b'O' | b'k' | b'K' => {}
+                    _ => {
+                        out.push('%');
+                        out.push('%');
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 3;
+            }
+            b'\\' => {
+                let Some(&next) = bytes.get(i + 1) else {
+                    i += 1;
+                    continue;
+                };
+                match next {
+                    b'\\' => {
+                        out.push('\\');
+                        i += 2;
+                    }
+                    b'{' => {
+                        out.push('{');
+                        i += 2;
+                    }
+                    b'}' => {
+                        out.push('}');
+                        i += 2;
+                    }
+                    b'~' => {
+                        out.push(' ');
+                        i += 2;
+                    }
+                    b'P' => {
+                        out.push('\n');
+                        i += 2;
+                    }
+                    b'L' | b'l' | b'O' | b'o' | b'K' | b'k' => {
+                        // formatting toggles; ignore.
+                        i += 2;
+                    }
+                    b'U' => {
+                        if let Some((ch, consumed)) = bytes.get(i + 1..).and_then(parse_unicode_hex)
+                        {
+                            out.push(ch);
+                            i += 1 + consumed;
+                        } else {
+                            i += 2;
+                        }
+                    }
+                    b'S' => {
+                        // Stacked fraction up to ';'
+                        let start = i + 2;
+                        let mut end = start;
+                        while end < bytes.len() && bytes[end] != b';' {
+                            end += 1;
+                        }
+                        if let Ok(content) = core::str::from_utf8(&bytes[start..end]) {
+                            out.push_str(&decode_stacked_fraction(content));
+                        }
+                        i = if end < bytes.len() { end + 1 } else { end };
+                    }
+                    _ => {
+                        // Skip formatting commands (usually terminated by ';').
+                        // This includes \C, \H, \W, \A, \F, \Q, \T and \p...; paragraph modifiers.
+                        // Also handle multi-letter commands (e.g. \pxqc;).
+                        if has_semicolon_ahead(bytes, i + 2) {
+                            i = skip_until_semicolon(bytes, i + 2);
+                        } else {
+                            // Unknown escape without a terminator: drop the escape marker only.
+                            i += 2;
+                        }
+                    }
+                }
+            }
+            _ => {
+                let ch = combined[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out.into()
 }
 
 #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
@@ -216,7 +416,7 @@ fn text_item_from_attribute(
     };
 
     Some(TextItem {
-        text: text.into(),
+        text,
         style: style_for_text_height(
             styles,
             a.text_style_name.as_str(),
@@ -306,7 +506,7 @@ fn text_item_from_attribute_definition(
     };
 
     Some(TextItem {
-        text: text.into(),
+        text,
         style: style_for_text_height(
             styles,
             a.text_style_name.as_str(),
@@ -343,7 +543,7 @@ fn chunk_from_entity(
             // TODO: Handle columns.
             // TODO: Handle paragraph styles.
             // TODO: Handle rotation.
-            let nt = decode_dxf_mtext_value(&mt.text, &mt.extended_text);
+            let text = decode_dxf_mtext_value(&mt.text, &mt.extended_text);
 
             let x_angle = Vec2 {
                 x: mt.x_axis_direction.x,
@@ -378,7 +578,7 @@ fn chunk_from_entity(
             BlockChunk::Text(
                 ce,
                 TextItem {
-                    text: nt.into(),
+                    text,
                     // TODO: Map more styling information from the MText
                     style: styles.get(mt.text_style_name.as_str()).map_or_else(
                         || StyleSet::new(mt.initial_text_height as f32),
@@ -476,7 +676,7 @@ fn chunk_from_entity(
             BlockChunk::Text(
                 ce,
                 TextItem {
-                    text: text.into(),
+                    text,
                     style: style_for_text_height(
                         styles,
                         t.text_style_name.as_str(),
@@ -1879,6 +2079,44 @@ fn dxf_entity_type_name(entity_type: &EntityType) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_text_control_codes() {
+        assert_eq!(&*decode_dxf_text_value("A%%c%%d%%p%%%B"), "A∅°±%B");
+        assert_eq!(&*decode_dxf_text_value("A%%uB%%uC"), "ABC");
+    }
+
+    #[test]
+    fn decode_text_unicode_decimal() {
+        // Per DXF control codes, %%nnn is a Unicode codepoint expressed as decimal.
+        assert_eq!(&*decode_dxf_text_value("A%%123B"), "A{B");
+        assert_eq!(&*decode_dxf_text_value("%%176"), "°");
+    }
+
+    #[test]
+    fn decode_mtext_inline_formatting() {
+        let empty: &[String] = &[];
+        assert_eq!(
+            &*decode_dxf_mtext_value("{\\LHello\\l} world\\PSecond", empty),
+            "Hello world\nSecond"
+        );
+        assert_eq!(
+            &*decode_dxf_mtext_value("Frac: \\S1#4; end", empty),
+            "Frac: 1/4 end"
+        );
+        assert_eq!(
+            &*decode_dxf_mtext_value("Unicode: \\U+00B0", empty),
+            "Unicode: °"
+        );
+        assert_eq!(
+            &*decode_dxf_mtext_value("Color: \\C1;Red", empty),
+            "Color: Red"
+        );
+        assert_eq!(
+            &*decode_dxf_mtext_value("Esc: \\\\ \\{ \\} \\~", empty),
+            "Esc: \\ { }  "
+        );
+    }
 
     #[test]
     fn insert_attributes_render_as_text() {
