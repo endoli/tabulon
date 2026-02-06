@@ -1,0 +1,22 @@
+[package]
+name = "dxf_to_svg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0.98"
+joto_constants = "0.2.0"
+parley = { workspace = true }
+
+tabulon = { workspace = true, features = ["std"] }
+tabulon_dxf = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+parley = { workspace = true, features = ["system"] }
+
+[lints]
+workspace = true
