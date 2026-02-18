@@ -13,7 +13,7 @@ std = ["tabulon/std"]
 libm = ["tabulon/libm"]
 
 [dependencies]
-dxf = { version = "0.6.0", git = "https://github.com/ixmilia/dxf-rs/", rev = "74c2acc" }
+dxf = { version = "0.6", git = "https://github.com/xorgy/dxf-rs", rev = "3311c61" }
 getrandom = "0.3.1"
 joto_constants = "0.2.0"
 parley = { workspace = true }

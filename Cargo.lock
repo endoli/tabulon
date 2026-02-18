@@ -475,7 +475,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 [[package]]
 name = "dxf"
 version = "0.6.0"
-source = "git+https://github.com/ixmilia/dxf-rs/?rev=74c2acc#74c2acc994d776a12e33ea57c3416d9ddf300a5e"
+source = "git+https://github.com/xorgy/dxf-rs?rev=3311c61#3311c6110686cd373c03d59d4d14716da49f382d"
 dependencies = [
  "byteorder",
  "chrono",
