@@ -67,8 +67,8 @@ enum BlockChunk {
     Unsupported,
     /// Path with a particular color and weight.
     Path(i16, i16, BezPath),
-    /// Text item. DXF color enum and [`TextItem`].
-    Text(i16, TextItem),
+    /// Text item. DXF color enum, [`TextItem`], and whether it should render when INSERT has ATTRIBs.
+    Text(i16, TextItem, bool),
 }
 
 fn parse_unicode_hex(input: &[u8]) -> Option<(char, usize)> {
@@ -323,18 +323,16 @@ fn style_for_text_height(
     text_height: f64,
     oblique_angle: f64,
 ) -> StyleSet<Option<Color>> {
-    let mut style = styles.get(style_name).map_or_else(
-        || StyleSet::new(text_height as f32),
-        |s| {
-            if style_size_is_zero(s) {
-                let mut news = s.clone();
-                news.insert(StyleProperty::FontSize(text_height as f32));
-                news
-            } else {
-                s.clone()
-            }
-        },
-    );
+    let mut style = styles
+        .get(style_name)
+        .cloned()
+        .unwrap_or_else(|| StyleSet::new(text_height as f32));
+    if text_height > 0.0 {
+        // Entity-level height should take precedence over fixed style height.
+        style.insert(StyleProperty::FontSize(text_height as f32));
+    } else if style_size_is_zero(&style) {
+        style.insert(StyleProperty::FontSize(text_height as f32));
+    }
     if oblique_angle != 0.0 {
         style.insert(StyleProperty::FontStyle(FontStyle::Oblique(Some(
             oblique_angle as f32,
@@ -438,7 +436,7 @@ fn text_item_from_attribute_definition(
     styles: &BTreeMap<&str, StyleSet<Option<Color>>>,
 ) -> Option<TextItem> {
     // FIXME: currently only support viewing from +Z.
-    if a.normal.z != 1.0 || a.is_invisible() {
+    if a.normal.z != 1.0 || a.is_invisible() || !a.is_constant() {
         return None;
     }
 
@@ -601,6 +599,7 @@ fn chunk_from_entity(
                     max_inline_size,
                     attachment_point,
                 },
+                true,
             )
         }
         #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
@@ -691,13 +690,14 @@ fn chunk_from_entity(
                     max_inline_size: None,
                     attachment_point,
                 },
+                true,
             )
         }
         EntityType::Attribute(ref a) => text_item_from_attribute(a, styles)
-            .map(|ti| BlockChunk::Text(ce, ti))
+            .map(|ti| BlockChunk::Text(ce, ti, true))
             .unwrap_or(BlockChunk::Unsupported),
         EntityType::AttributeDefinition(ref a) => text_item_from_attribute_definition(a, styles)
-            .map(|ti| BlockChunk::Text(ce, ti))
+            .map(|ti| BlockChunk::Text(ce, ti, false))
             .unwrap_or(BlockChunk::Unsupported),
         _ => {
             if let Some(p) = path_from_entity(e) {
@@ -1256,6 +1256,34 @@ fn recover_color_enum(c: &dxf::Color) -> i16 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LayerInfo<'a> {
+    handle: LayerHandle,
+    layer: &'a dxf::tables::Layer,
+    is_on: bool,
+}
+
+fn insert_instance_transforms(ins: &dxf::entities::Insert) -> alloc::vec::Vec<Affine> {
+    let base_transform = Affine::scale_non_uniform(ins.x_scale_factor, ins.y_scale_factor);
+    let rotation = -ins.rotation.to_radians();
+    let location = point_from_dxf_point(&ins.location).to_vec2();
+    let mut transforms = alloc::vec::Vec::new();
+    for i in 0..ins.row_count {
+        for j in 0..ins.column_count {
+            transforms.push(
+                base_transform
+                    .then_translate(Vec2::new(
+                        j as f64 * ins.column_spacing,
+                        i as f64 * ins.row_spacing,
+                    ))
+                    .then_rotate(rotation)
+                    .then_translate(location),
+            );
+        }
+    }
+    transforms
+}
+
 /// Load a DXF from a path into a [`TDDrawing`].
 #[cfg(feature = "std")]
 #[tracing::instrument(skip_all)]
@@ -1280,43 +1308,24 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
         fill_paint: None,
     });
 
-    let visible_layers: BTreeSet<&str> = drawing
-        .layers()
-        .filter_map(|l| l.is_layer_on.then_some(l.name.as_str()))
-        .collect();
-
-    let enabled_layers = drawing
-        .layers()
-        .filter_map(|l| {
-            l.is_layer_on
-                .then_some(LayerHandle(NonZeroU64::new(l.handle.0).unwrap()))
-        })
-        .collect();
-
-    let layer_names = drawing
-        .layers()
-        .map(|l| {
-            (
-                LayerHandle(NonZeroU64::new(l.handle.0).unwrap()),
-                l.name.as_str().into(),
-            )
-        })
-        .collect();
-
-    let handle_for_layer_name: BTreeMap<&str, LayerHandle> = drawing
-        .layers()
-        .map(|l| {
-            (
-                l.name.as_str(),
-                LayerHandle(NonZeroU64::new(l.handle.0).unwrap()),
-            )
-        })
-        .collect();
-
-    let layers: BTreeMap<LayerHandle, &dxf::tables::Layer> = drawing
-        .layers()
-        .map(|l| (LayerHandle(NonZeroU64::new(l.handle.0).unwrap()), l))
-        .collect();
+    let mut enabled_layers = BTreeSet::new();
+    let mut layer_names = BTreeMap::new();
+    let mut layer_info_by_name = BTreeMap::new();
+    for l in drawing.layers() {
+        let handle = LayerHandle(NonZeroU64::new(l.handle.0).unwrap());
+        if l.is_layer_on {
+            enabled_layers.insert(handle);
+        }
+        layer_names.insert(handle, l.name.as_str().into());
+        layer_info_by_name.insert(
+            l.name.as_str(),
+            LayerInfo {
+                handle,
+                layer: l,
+                is_on: l.is_layer_on,
+            },
+        );
+    }
 
     let styles: BTreeMap<&str, StyleSet<Option<Color>>> = drawing
         .styles()
@@ -1405,8 +1414,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                     continue;
                 }
 
-                let resolve_style = |lh: LayerHandle, lw: i16, ce: i16| {
-                    let layer = layers[&lh];
+                let resolve_style = |layer: &dxf::tables::Layer, lw: i16, ce: i16| {
                     let line_weight = if lw == -2 {
                         if layer.line_weight.raw_value() < 0 {
                             25_i16
@@ -1431,16 +1439,30 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                     (line_weight, color)
                 };
 
+                let find_layer_for = |name: &str| {
+                    if name.is_empty() {
+                        layer_info_by_name.get("0")
+                    } else {
+                        layer_info_by_name.get(name)
+                    }
+                };
+
+                let Some(first_layer_info) = find_layer_for(b.entities[0].common.layer.as_str())
+                else {
+                    continue;
+                };
                 let mut cur_style = resolve_style(
-                    handle_for_layer_name[b.entities[0].common.layer.as_str()],
+                    first_layer_info.layer,
                     b.entities[0].common.lineweight_enum_value,
                     recover_color_enum(&b.entities[0].common.color),
                 );
 
                 for e in b.entities.iter() {
-                    let lh = handle_for_layer_name[e.common.layer.as_str()];
+                    let Some(layer_info) = find_layer_for(e.common.layer.as_str()) else {
+                        continue;
+                    };
                     let style = resolve_style(
-                        lh,
+                        layer_info.layer,
                         if matches!(e.specific, EntityType::Solid(..)) {
                             // Use `i16::MIN` for solid fills.
                             i16::MIN
@@ -1468,11 +1490,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                 continue;
                             }
                             if let Some(b) = blocks.get(ins.name.as_str()) {
-                                let base_transform = Affine::scale_non_uniform(
-                                    ins.x_scale_factor,
-                                    ins.y_scale_factor,
-                                );
-                                let location = point_from_dxf_point(&ins.location);
+                                let transforms = insert_instance_transforms(ins);
 
                                 if !lines.is_empty() {
                                     // Always push a chunk before an insert if not empty.
@@ -1498,18 +1516,9 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                                 *ce
                                             };
                                             lines = BezPath::new();
-                                            for i in 0..ins.row_count {
-                                                for j in 0..ins.column_count {
-                                                    let transform = base_transform
-                                                        .then_translate(Vec2::new(
-                                                            j as f64 * ins.column_spacing,
-                                                            i as f64 * ins.row_spacing,
-                                                        ))
-                                                        .then_rotate(-ins.rotation.to_radians())
-                                                        .then_translate(location.to_vec2());
-                                                    // Add the transformed instance to the new path.
-                                                    lines.extend(transform * clines);
-                                                }
+                                            for transform in transforms.iter().copied() {
+                                                // Add the transformed instance to the new path.
+                                                lines.extend(transform * clines);
                                             }
                                             chunks.push(BlockChunk::Path(
                                                 local_linewidth,
@@ -1521,7 +1530,10 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                             clippy::cast_possible_truncation,
                                             reason = "It doesn't matter"
                                         )]
-                                        BlockChunk::Text(ce, ti) => {
+                                        BlockChunk::Text(ce, ti, render_with_attributes) => {
+                                            if ins.__has_attributes && !render_with_attributes {
+                                                continue;
+                                            }
                                             let TextItem {
                                                 text,
                                                 style,
@@ -1569,46 +1581,37 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                                     + (height_vector * fs.unwrap_or(1.0) as f64),
                                             };
 
-                                            for i in 0..ins.row_count {
-                                                for j in 0..ins.column_count {
-                                                    let transform = base_transform
-                                                        .then_translate(Vec2::new(
-                                                            j as f64 * ins.column_spacing,
-                                                            i as f64 * ins.row_spacing,
-                                                        ))
-                                                        .then_rotate(-ins.rotation.to_radians())
-                                                        .then_translate(location.to_vec2());
+                                            for transform in transforms.iter().copied() {
+                                                let tbline = transform * baseline;
+                                                let thline = transform * hline;
 
-                                                    let tbline = transform * baseline;
-                                                    let thline = transform * hline;
+                                                let angle = (tbline.p1 - tbline.p0).angle();
+                                                let displacement = tbline.p0.to_vec2();
 
-                                                    let angle = (tbline.p1 - tbline.p0).angle();
-                                                    let displacement = tbline.p0.to_vec2();
-
-                                                    let mut style = style.clone();
-                                                    let nfs = thline.length();
-                                                    if fs.is_some() {
-                                                        style.insert(StyleProperty::FontSize(
-                                                            nfs as f32,
-                                                        ));
-                                                    }
-
-                                                    chunks.push(BlockChunk::Text(
-                                                        local_color,
-                                                        TextItem {
-                                                            text: text.clone(),
-                                                            style,
-                                                            alignment,
-                                                            insertion: DirectIsometry {
-                                                                angle,
-                                                                displacement,
-                                                            },
-                                                            max_inline_size: max_inline_size
-                                                                .map(|_| tbline.length() as f32),
-                                                            attachment_point,
-                                                        },
+                                                let mut style = style.clone();
+                                                let nfs = thline.length();
+                                                if fs.is_some() {
+                                                    style.insert(StyleProperty::FontSize(
+                                                        nfs as f32,
                                                     ));
                                                 }
+
+                                                chunks.push(BlockChunk::Text(
+                                                    local_color,
+                                                    TextItem {
+                                                        text: text.clone(),
+                                                        style,
+                                                        alignment,
+                                                        insertion: DirectIsometry {
+                                                            angle,
+                                                            displacement,
+                                                        },
+                                                        max_inline_size: max_inline_size
+                                                            .map(|_| tbline.length() as f32),
+                                                        attachment_point,
+                                                    },
+                                                    *render_with_attributes,
+                                                ));
                                             }
                                         }
                                         _ => {}
@@ -1618,7 +1621,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                 // Render any attribute values attached to this insert.
                                 for a in ins.attributes() {
                                     if let Some(ti) = text_item_from_attribute(a, &styles) {
-                                        chunks.push(BlockChunk::Text(cur_style.1, ti));
+                                        chunks.push(BlockChunk::Text(cur_style.1, ti, true));
                                     }
                                 }
                                 lines = BezPath::new();
@@ -1628,7 +1631,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                             BlockChunk::Path(_, _, s) => {
                                 lines.extend(s);
                             }
-                            BlockChunk::Text(_, ti) => {
+                            BlockChunk::Text(_, ti, render_with_attributes) => {
                                 // eprintln!("ENCOUNTERED TEXT IN BLOCK DEFINITION");
                                 // eprintln!("{e:#?}");
                                 // eprintln!("{ti:#?}");
@@ -1636,7 +1639,11 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                     chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, lines));
                                     lines = BezPath::new();
                                 }
-                                chunks.push(BlockChunk::Text(cur_style.1, ti));
+                                chunks.push(BlockChunk::Text(
+                                    cur_style.1,
+                                    ti,
+                                    render_with_attributes,
+                                ));
                             }
                             BlockChunk::Unsupported => {
                                 if !lines.is_empty() {
@@ -1661,7 +1668,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                             BlockChunk::Path(_, _, path) => {
                                 path.apply_affine(base_transform);
                             }
-                            BlockChunk::Text(_, ti) => {
+                            BlockChunk::Text(_, ti, _) => {
                                 ti.insertion.displacement -= block_base;
                             }
                             BlockChunk::Unsupported => {}
@@ -1681,16 +1688,25 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
     let mut fills: BTreeMap<u32, PaintHandle> = BTreeMap::new();
 
     for e in drawing.entities() {
+        let layer_info = if e.common.layer.is_empty() {
+            layer_info_by_name.get("0")
+        } else {
+            layer_info_by_name.get(e.common.layer.as_str())
+        };
+
         if !e.common.is_visible
-            || !(e.common.layer.is_empty() || visible_layers.contains(e.common.layer.as_str()))
+            || !e.common.layer.is_empty() && !layer_info.is_some_and(|x| x.is_on)
         {
             continue;
         }
 
+        let Some(layer_info) = layer_info else {
+            continue;
+        };
         let eh = EntityHandle(NonZeroU64::new(e.common.handle.0).unwrap());
-        let lh = handle_for_layer_name[e.common.layer.as_str()];
+        let lh = layer_info.handle;
 
-        let layer = layers[&lh];
+        let layer = layer_info.layer;
 
         let mut resolve_paint = |gb: &mut GraphicsBag, lw: i16, c: i16| {
             // Resolve color.
@@ -1793,9 +1809,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                 }
 
                 if let Some(b) = blocks.get(ins.name.as_str()) {
-                    let base_transform =
-                        Affine::scale_non_uniform(ins.x_scale_factor, ins.y_scale_factor);
-                    let location = point_from_dxf_point(&ins.location);
+                    let transforms = insert_instance_transforms(ins);
 
                     for chunk in b {
                         match chunk {
@@ -1816,18 +1830,8 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                     },
                                 );
                                 let mut path = BezPath::new();
-                                for i in 0..ins.row_count {
-                                    for j in 0..ins.column_count {
-                                        let transform = base_transform
-                                            .then_translate(Vec2::new(
-                                                j as f64 * ins.column_spacing,
-                                                i as f64 * ins.row_spacing,
-                                            ))
-                                            .then_rotate(-ins.rotation.to_radians())
-                                            .then_translate(location.to_vec2());
-
-                                        path.extend(transform * clines);
-                                    }
+                                for transform in transforms.iter().copied() {
+                                    path.extend(transform * clines);
                                 }
                                 push_item(
                                     &mut gb,
@@ -1840,7 +1844,10 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                 );
                             }
                             #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
-                            BlockChunk::Text(ce, ti) => {
+                            BlockChunk::Text(ce, ti, render_with_attributes) => {
+                                if ins.__has_attributes && !render_with_attributes {
+                                    continue;
+                                }
                                 let TextItem {
                                     text,
                                     style,
@@ -1888,47 +1895,37 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                     },
                                 );
 
-                                for i in 0..ins.row_count {
-                                    for j in 0..ins.column_count {
-                                        let transform = base_transform
-                                            .then_translate(Vec2::new(
-                                                j as f64 * ins.column_spacing,
-                                                i as f64 * ins.row_spacing,
-                                            ))
-                                            .then_rotate(-ins.rotation.to_radians())
-                                            .then_translate(location.to_vec2());
+                                for transform in transforms.iter().copied() {
+                                    let tbline = transform * baseline;
+                                    let thline = transform * hline;
 
-                                        let tbline = transform * baseline;
-                                        let thline = transform * hline;
+                                    let angle = (tbline.p1 - tbline.p0).angle();
+                                    let displacement = tbline.p0.to_vec2();
 
-                                        let angle = (tbline.p1 - tbline.p0).angle();
-                                        let displacement = tbline.p0.to_vec2();
-
-                                        let mut style = style.clone();
-                                        let nfs = thline.length();
-                                        if fs.is_some() {
-                                            style.insert(StyleProperty::FontSize(nfs as f32));
-                                        }
-
-                                        push_item(
-                                            &mut gb,
-                                            FatText {
-                                                transform: Default::default(),
-                                                paint,
-                                                text: text.clone(),
-                                                style: style.clone(),
-                                                alignment,
-                                                insertion: DirectIsometry {
-                                                    angle,
-                                                    displacement,
-                                                },
-                                                max_inline_size: max_inline_size
-                                                    .map(|_| tbline.length() as f32),
-                                                attachment_point,
-                                            }
-                                            .into(),
-                                        );
+                                    let mut style = style.clone();
+                                    let nfs = thline.length();
+                                    if fs.is_some() {
+                                        style.insert(StyleProperty::FontSize(nfs as f32));
                                     }
+
+                                    push_item(
+                                        &mut gb,
+                                        FatText {
+                                            transform: Default::default(),
+                                            paint,
+                                            text: text.clone(),
+                                            style: style.clone(),
+                                            alignment,
+                                            insertion: DirectIsometry {
+                                                angle,
+                                                displacement,
+                                            },
+                                            max_inline_size: max_inline_size
+                                                .map(|_| tbline.length() as f32),
+                                            attachment_point,
+                                        }
+                                        .into(),
+                                    );
                                 }
                             }
                             BlockChunk::Unsupported => {
@@ -1979,7 +1976,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                         .into(),
                     );
                 }
-                BlockChunk::Text(_, ti) => {
+                BlockChunk::Text(_, ti, _) => {
                     let TextItem {
                         text,
                         style,
@@ -2249,5 +2246,26 @@ mod tests {
 
         assert!(texts.iter().any(|t| t == "3b"), "expected to find \"3b\"");
         assert!(texts.iter().any(|t| t == "WF"), "expected to find \"WF\"");
+    }
+
+    #[test]
+    fn entity_text_height_overrides_fixed_style_height() {
+        let mut styles = BTreeMap::new();
+        styles.insert("FT-TEXT", StyleSet::new(250.0));
+
+        let style = style_for_text_height(&styles, "FT-TEXT", 1.744_120_1, 0.0);
+        let fs = style
+            .inner()
+            .get(&discriminant(&StyleProperty::FontSize(0.0)))
+            .and_then(|p| {
+                if let StyleProperty::FontSize(fs) = p {
+                    Some(*fs)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+
+        assert!((fs - 1.744_120_1).abs() < 1e-6);
     }
 }
