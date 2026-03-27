@@ -3,11 +3,10 @@
 
 //! DXF loader for Tabulon
 
-pub use dxf;
-use dxf::{
-    Drawing, DxfResult,
-    entities::EntityType,
-    enums::{HorizontalTextJustification, VerticalTextJustification},
+pub use dxfscan;
+use dxfscan::{
+    Block, Drawing, Entity, EntityCommon, Point3,
+    entity::{AttDef, Attrib, Hatch, HatchBoundaryPath, HatchEdge, Insert, LwPolylineVertex},
 };
 
 use tabulon::{
@@ -41,11 +40,11 @@ use core::{cmp::Ordering, mem::discriminant, num::NonZeroU64};
 mod aci_palette;
 use aci_palette::ACI;
 
-/// A valid handle for an [`Entity`](dxf::entities::Entity) present in the drawing.
+/// A valid handle for an entity present in the drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EntityHandle(pub(crate) NonZeroU64);
 
-/// A valid handle for a [`Layer`](dxf::tables::Layer) present in the drawing.
+/// A valid handle for a layer present in the drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LayerHandle(pub(crate) NonZeroU64);
 
@@ -88,7 +87,8 @@ fn parse_unicode_hex(input: &[u8]) -> Option<(char, usize)> {
     Some((ch, j))
 }
 
-fn decode_dxf_text_value(text: &str) -> sync::Arc<str> {
+fn decode_dxf_text_value(text: &[u8]) -> sync::Arc<str> {
+    let text = core::str::from_utf8(text).unwrap_or("");
     // TEXT control codes:
     // - %%c, %%d, %%p
     // - %%% for literal '%'
@@ -173,10 +173,13 @@ fn decode_dxf_text_value(text: &str) -> sync::Arc<str> {
     out.into()
 }
 
-fn decode_dxf_mtext_value(text: &str, extended_text: &[String]) -> sync::Arc<str> {
-    let mut combined = text.to_owned();
-    for ext in extended_text.iter() {
-        combined.push_str(ext);
+fn decode_dxf_mtext_value(text: &[u8], extended_text: &[&[u8]]) -> sync::Arc<str> {
+    let text_str = core::str::from_utf8(text).unwrap_or("");
+    let mut combined = text_str.to_owned();
+    for ext in extended_text {
+        if let Ok(s) = core::str::from_utf8(ext) {
+            combined.push_str(s);
+        }
     }
 
     fn skip_until_semicolon(bytes: &[u8], mut i: usize) -> usize {
@@ -322,6 +325,7 @@ fn style_for_text_height(
     style_name: &str,
     text_height: f64,
     oblique_angle: f64,
+    width_factor: f64,
 ) -> StyleSet<Option<Color>> {
     let mut style = styles
         .get(style_name)
@@ -338,88 +342,87 @@ fn style_for_text_height(
             oblique_angle as f32,
         ))));
     }
+    if width_factor != 1.0 {
+        // Entity-level width factor overrides the style's width factor.
+        style.insert(StyleProperty::FontWidth(FontWidth::from_ratio(
+            width_factor as f32,
+        )));
+    }
     style
 }
 
-fn text_item_from_attribute(
-    a: &dxf::entities::Attribute,
+/// Resolve text justification to an attachment point from raw i16 h/v justify values.
+fn text_justify_attachment_point(h_justify: i16, v_justify: i16) -> AttachmentPoint {
+    match (h_justify, v_justify) {
+        (0, 3) => AttachmentPoint::TopLeft,       // Left, Top
+        (1 | 4, 3) => AttachmentPoint::TopCenter, // Center|Middle, Top
+        (2, 3) => AttachmentPoint::TopRight,      // Right, Top
+        (0, 2) => AttachmentPoint::MiddleLeft,    // Left, Middle
+        (1 | 4, 2) => AttachmentPoint::MiddleCenter,
+        (2, 2) => AttachmentPoint::MiddleRight,
+        (0, 1) => AttachmentPoint::BottomLeft, // Left, Bottom
+        (1 | 4, 1) => AttachmentPoint::BottomCenter,
+        (2, 1) => AttachmentPoint::BottomRight,
+        (0, 0) => AttachmentPoint::BottomLeft, // Left, Baseline
+        (1 | 4, 0) => AttachmentPoint::BottomCenter,
+        (2, 0) => AttachmentPoint::BottomRight,
+        (3 | 5, 3) => AttachmentPoint::TopLeft, // Aligned|Fit, Top
+        (3 | 5, 2) => AttachmentPoint::MiddleLeft,
+        (3 | 5, _) => AttachmentPoint::BottomLeft,
+        _ => AttachmentPoint::BottomLeft,
+    }
+}
+
+/// Resolve text alignment from raw `h_justify` i16.
+fn text_justify_alignment(h_justify: i16) -> Alignment {
+    match h_justify {
+        0 => Alignment::Left,
+        2 => Alignment::Right,
+        1 | 4 => Alignment::Center,
+        // Aligned (3) and Fit (5) need further attention.
+        3 | 5 => Alignment::Left,
+        _ => Alignment::Left,
+    }
+}
+
+fn text_item_from_attrib(
+    a: &Attrib<'_>,
+    common: &EntityCommon<'_>,
     styles: &BTreeMap<&str, StyleSet<Option<Color>>>,
 ) -> Option<TextItem> {
     // FIXME: currently only support viewing from +Z.
-    if a.normal.z != 1.0 || a.is_invisible() {
+    if common.extrusion.z != 1.0 || a.flags & 1 != 0 {
         return None;
     }
 
-    let text = if a.value.is_empty()
-        && (!a.m_text.text.is_empty() || !a.m_text.extended_text.is_empty())
-    {
-        decode_dxf_mtext_value(&a.m_text.text, &a.m_text.extended_text)
+    let text = if let Some(mt) = &a.mtext {
+        decode_dxf_mtext_value(mt.text, &mt.extended_text)
     } else {
-        decode_dxf_text_value(&a.value)
+        decode_dxf_text_value(a.value)
+    };
+    let attachment_point = text_justify_attachment_point(a.h_justify, a.v_justify);
+    let alignment = text_justify_alignment(a.h_justify);
+
+    let angle = match a.h_justify {
+        3 | 5 => (point_from_dxf_point(a.second_alignment_point).to_vec2()
+            - point_from_dxf_point(a.location).to_vec2())
+        .angle(),
+        _ => -a.rotation.to_radians(),
     };
 
-    let attachment_point = {
-        use HorizontalTextJustification as H;
-        use VerticalTextJustification as V;
-        match (
-            a.horizontal_text_justification,
-            a.vertical_text_justification,
-        ) {
-            (H::Left, V::Top) => AttachmentPoint::TopLeft,
-            (H::Center | H::Middle, V::Top) => AttachmentPoint::TopCenter,
-            (H::Right, V::Top) => AttachmentPoint::TopRight,
-            (H::Left, V::Middle) => AttachmentPoint::MiddleLeft,
-            (H::Center | H::Middle, V::Middle) => AttachmentPoint::MiddleCenter,
-            (H::Right, V::Middle) => AttachmentPoint::MiddleRight,
-            (H::Left, V::Bottom) => AttachmentPoint::BottomLeft,
-            (H::Center | H::Middle, V::Bottom) => AttachmentPoint::BottomCenter,
-            (H::Right, V::Bottom) => AttachmentPoint::BottomRight,
-            (H::Left, V::Baseline) => AttachmentPoint::BottomLeft,
-            (H::Center | H::Middle, V::Baseline) => AttachmentPoint::BottomCenter,
-            (H::Right, V::Baseline) => AttachmentPoint::BottomRight,
-            // These need further attention.
-            (H::Aligned | H::Fit, V::Top) => AttachmentPoint::TopLeft,
-            (H::Aligned | H::Fit, V::Middle) => AttachmentPoint::MiddleLeft,
-            (H::Aligned | H::Fit, V::Bottom | V::Baseline) => AttachmentPoint::BottomLeft,
-        }
-    };
-
-    let alignment = {
-        use HorizontalTextJustification::*;
-        match a.horizontal_text_justification {
-            Left => Alignment::Left,
-            Right => Alignment::Right,
-            Center | Middle => Alignment::Center,
-            // These need further attention.
-            Aligned | Fit => Alignment::Left,
-        }
-    };
-
-    let angle = {
-        use HorizontalTextJustification as H;
-        match a.horizontal_text_justification {
-            H::Aligned | H::Fit => (point_from_dxf_point(&a.second_alignment_point).to_vec2()
-                - point_from_dxf_point(&a.location).to_vec2())
-            .angle(),
-            _ => -a.rotation.to_radians(),
-        }
-    };
-
-    let displacement = {
-        use HorizontalTextJustification as H;
-        match a.horizontal_text_justification {
-            H::Center => point_from_dxf_point(&a.second_alignment_point).to_vec2(),
-            _ => point_from_dxf_point(&a.location).to_vec2(),
-        }
+    let displacement = match a.h_justify {
+        0 if a.v_justify == 0 => point_from_dxf_point(a.location).to_vec2(),
+        _ => point_from_dxf_point(a.second_alignment_point).to_vec2(),
     };
 
     Some(TextItem {
         text,
         style: style_for_text_height(
             styles,
-            a.text_style_name.as_str(),
-            a.text_height,
+            core::str::from_utf8(a.style_name).unwrap_or(""),
+            a.height,
             a.oblique_angle,
+            1.0,
         ),
         alignment,
         insertion: DirectIsometry {
@@ -431,85 +434,45 @@ fn text_item_from_attribute(
     })
 }
 
-fn text_item_from_attribute_definition(
-    a: &dxf::entities::AttributeDefinition,
+fn text_item_from_attdef(
+    a: &AttDef<'_>,
+    common: &EntityCommon<'_>,
     styles: &BTreeMap<&str, StyleSet<Option<Color>>>,
 ) -> Option<TextItem> {
     // FIXME: currently only support viewing from +Z.
-    if a.normal.z != 1.0 || a.is_invisible() || !a.is_constant() {
+    // Only render constant attribute definitions (flag bit 1 = constant).
+    if common.extrusion.z != 1.0 || a.flags & 1 != 0 || a.flags & 2 == 0 {
         return None;
     }
 
-    let text = if a.value.is_empty()
-        && (!a.m_text.text.is_empty() || !a.m_text.extended_text.is_empty())
-    {
-        decode_dxf_mtext_value(&a.m_text.text, &a.m_text.extended_text)
+    let text = if let Some(mt) = &a.mtext {
+        decode_dxf_mtext_value(mt.text, &mt.extended_text)
     } else {
-        decode_dxf_text_value(&a.value)
+        decode_dxf_text_value(a.value)
+    };
+    let attachment_point = text_justify_attachment_point(a.h_justify, a.v_justify);
+    let alignment = text_justify_alignment(a.h_justify);
+
+    let angle = match a.h_justify {
+        3 | 5 => (point_from_dxf_point(a.second_alignment_point).to_vec2()
+            - point_from_dxf_point(a.location).to_vec2())
+        .angle(),
+        _ => -a.rotation.to_radians(),
     };
 
-    let attachment_point = {
-        use HorizontalTextJustification as H;
-        use VerticalTextJustification as V;
-        match (
-            a.horizontal_text_justification,
-            a.vertical_text_justification,
-        ) {
-            (H::Left, V::Top) => AttachmentPoint::TopLeft,
-            (H::Center | H::Middle, V::Top) => AttachmentPoint::TopCenter,
-            (H::Right, V::Top) => AttachmentPoint::TopRight,
-            (H::Left, V::Middle) => AttachmentPoint::MiddleLeft,
-            (H::Center | H::Middle, V::Middle) => AttachmentPoint::MiddleCenter,
-            (H::Right, V::Middle) => AttachmentPoint::MiddleRight,
-            (H::Left, V::Bottom) => AttachmentPoint::BottomLeft,
-            (H::Center | H::Middle, V::Bottom) => AttachmentPoint::BottomCenter,
-            (H::Right, V::Bottom) => AttachmentPoint::BottomRight,
-            (H::Left, V::Baseline) => AttachmentPoint::BottomLeft,
-            (H::Center | H::Middle, V::Baseline) => AttachmentPoint::BottomCenter,
-            (H::Right, V::Baseline) => AttachmentPoint::BottomRight,
-            // These need further attention.
-            (H::Aligned | H::Fit, V::Top) => AttachmentPoint::TopLeft,
-            (H::Aligned | H::Fit, V::Middle) => AttachmentPoint::MiddleLeft,
-            (H::Aligned | H::Fit, V::Bottom | V::Baseline) => AttachmentPoint::BottomLeft,
-        }
-    };
-
-    let alignment = {
-        use HorizontalTextJustification::*;
-        match a.horizontal_text_justification {
-            Left => Alignment::Left,
-            Right => Alignment::Right,
-            Center | Middle => Alignment::Center,
-            // These need further attention.
-            Aligned | Fit => Alignment::Left,
-        }
-    };
-
-    let angle = {
-        use HorizontalTextJustification as H;
-        match a.horizontal_text_justification {
-            H::Aligned | H::Fit => (point_from_dxf_point(&a.second_alignment_point).to_vec2()
-                - point_from_dxf_point(&a.location).to_vec2())
-            .angle(),
-            _ => -a.rotation.to_radians(),
-        }
-    };
-
-    let displacement = {
-        use HorizontalTextJustification as H;
-        match a.horizontal_text_justification {
-            H::Center => point_from_dxf_point(&a.second_alignment_point).to_vec2(),
-            _ => point_from_dxf_point(&a.location).to_vec2(),
-        }
+    let displacement = match a.h_justify {
+        0 if a.v_justify == 0 => point_from_dxf_point(a.location).to_vec2(),
+        _ => point_from_dxf_point(a.second_alignment_point).to_vec2(),
     };
 
     Some(TextItem {
         text,
         style: style_for_text_height(
             styles,
-            a.text_style_name.as_str(),
-            a.text_height,
+            core::str::from_utf8(a.style_name).unwrap_or(""),
+            a.height,
             a.oblique_angle,
+            1.0,
         ),
         alignment,
         insertion: DirectIsometry {
@@ -519,19 +482,33 @@ fn text_item_from_attribute_definition(
         max_inline_size: None,
         attachment_point,
     })
+}
+
+/// Resolves the effective color enum from entity common fields.
+///
+/// When an entity has an explicit ACI color (1-255), that takes precedence
+/// even if `color_24_bit` is also set (autocad writes both for compatibility).
+/// True color (257) is only used when the ACI color is BYLAYER/BYBLOCK/unset.
+fn effective_color(common: &EntityCommon<'_>) -> i16 {
+    match common.color {
+        1..=255 => common.color,
+        _ if common.color_24_bit != 0 => 257_i16,
+        c => c,
+    }
 }
 
 /// Convert an entity to a [`BlockChunk`].
 fn chunk_from_entity(
-    e: &dxf::entities::Entity,
+    entity: &Entity<'_>,
     styles: &BTreeMap<&str, StyleSet<Option<Color>>>,
 ) -> BlockChunk {
-    let ce = recover_color_enum(&e.common.color);
-    match e.specific {
+    let common = entity.common();
+    let ce = effective_color(common);
+    match entity {
         #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
-        EntityType::MText(ref mt) => {
+        Entity::MText(common, mt) => {
             // FIXME: currently only support viewing from +Z.
-            if mt.extrusion_direction.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return BlockChunk::Unsupported;
             }
 
@@ -541,7 +518,7 @@ fn chunk_from_entity(
             // TODO: Handle columns.
             // TODO: Handle paragraph styles.
             // TODO: Handle rotation.
-            let text = decode_dxf_mtext_value(&mt.text, &mt.extended_text);
+            let text = decode_dxf_mtext_value(mt.text, &mt.extended_text);
 
             let x_angle = Vec2 {
                 x: mt.x_axis_direction.x,
@@ -566,35 +543,30 @@ fn chunk_from_entity(
                 None
             } else {
                 match mt.column_type {
-                    0 => (mt.reference_rectangle_width != 0.0)
-                        .then_some(mt.reference_rectangle_width as f32),
-                    1 => (mt.column_width != 0.0).then_some(mt.column_width as f32),
+                    0 => (mt.reference_rect_width != 0.0).then_some(mt.reference_rect_width as f32),
+                    1 => {
+                        let w = if mt.column_width != 0.0 {
+                            mt.column_width
+                        } else {
+                            mt.reference_rect_width
+                        };
+                        (w != 0.0).then_some(w as f32)
+                    }
                     _ => None,
                 }
             };
 
+            let style_name = core::str::from_utf8(mt.style_name).unwrap_or("");
             BlockChunk::Text(
                 ce,
                 TextItem {
                     text,
-                    // TODO: Map more styling information from the MText
-                    style: styles.get(mt.text_style_name.as_str()).map_or_else(
-                        || StyleSet::new(mt.initial_text_height as f32),
-                        |s| {
-                            if style_size_is_zero(s) {
-                                let mut news = s.clone();
-                                news.insert(StyleProperty::FontSize(mt.initial_text_height as f32));
-                                news
-                            } else {
-                                s.clone()
-                            }
-                        },
-                    ),
+                    style: style_for_text_height(styles, style_name, mt.height, 0.0, 1.0),
                     alignment,
                     insertion: DirectIsometry::new(
                         // As far as I'm aware, x_axis_direction and rotation are exclusive.
                         -mt.rotation_angle.to_radians() + x_angle,
-                        point_from_dxf_point(&mt.insertion_point).to_vec2(),
+                        point_from_dxf_point(mt.insertion_point).to_vec2(),
                     ),
                     max_inline_size,
                     attachment_point,
@@ -603,9 +575,9 @@ fn chunk_from_entity(
             )
         }
         #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
-        EntityType::Text(ref t) => {
+        Entity::Text(common, t) => {
             // FIXME: currently only support viewing from +Z.
-            if t.normal.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return BlockChunk::Unsupported;
             }
 
@@ -614,73 +586,34 @@ fn chunk_from_entity(
 
             // TODO: Implement a shared parser for scanning formatting codes into styled text
             //       and doing unicode substitution for special character codes.
-            let text = decode_dxf_text_value(&t.value);
+            let text = decode_dxf_text_value(t.value);
 
-            let attachment_point = {
-                use HorizontalTextJustification as H;
-                use VerticalTextJustification as V;
-                match (
-                    t.horizontal_text_justification,
-                    t.vertical_text_justification,
-                ) {
-                    (H::Left, V::Top) => AttachmentPoint::TopLeft,
-                    (H::Center | H::Middle, V::Top) => AttachmentPoint::TopCenter,
-                    (H::Right, V::Top) => AttachmentPoint::TopRight,
-                    (H::Left, V::Middle) => AttachmentPoint::MiddleLeft,
-                    (H::Center | H::Middle, V::Middle) => AttachmentPoint::MiddleCenter,
-                    (H::Right, V::Middle) => AttachmentPoint::MiddleRight,
-                    (H::Left, V::Bottom) => AttachmentPoint::BottomLeft,
-                    (H::Center | H::Middle, V::Bottom) => AttachmentPoint::BottomCenter,
-                    (H::Right, V::Bottom) => AttachmentPoint::BottomRight,
-                    (H::Left, V::Baseline) => AttachmentPoint::BottomLeft,
-                    (H::Center | H::Middle, V::Baseline) => AttachmentPoint::BottomCenter,
-                    (H::Right, V::Baseline) => AttachmentPoint::BottomRight,
-                    // These need further attention.
-                    (H::Aligned | H::Fit, V::Top) => AttachmentPoint::TopLeft,
-                    (H::Aligned | H::Fit, V::Middle) => AttachmentPoint::MiddleLeft,
-                    (H::Aligned | H::Fit, V::Bottom | V::Baseline) => AttachmentPoint::BottomLeft,
-                }
+            let attachment_point = text_justify_attachment_point(t.h_justify, t.v_justify);
+            let alignment = text_justify_alignment(t.h_justify);
+
+            let angle = match t.h_justify {
+                3 | 5 => (point_from_dxf_point(t.second_alignment_point).to_vec2()
+                    - point_from_dxf_point(t.insertion_point).to_vec2())
+                .angle(),
+                _ => -t.rotation.to_radians(),
             };
 
-            let alignment = {
-                use HorizontalTextJustification::*;
-                match t.horizontal_text_justification {
-                    Left => Alignment::Left,
-                    Right => Alignment::Right,
-                    Center | Middle => Alignment::Center,
-                    // These need further attention.
-                    Aligned | Fit => Alignment::Left,
-                }
+            let displacement = match t.h_justify {
+                0 if t.v_justify == 0 => point_from_dxf_point(t.insertion_point).to_vec2(),
+                _ => point_from_dxf_point(t.second_alignment_point).to_vec2(),
             };
 
-            let angle = {
-                use HorizontalTextJustification as H;
-                match t.horizontal_text_justification {
-                    H::Aligned | H::Fit => (point_from_dxf_point(&t.second_alignment_point)
-                        .to_vec2()
-                        - point_from_dxf_point(&t.location).to_vec2())
-                    .angle(),
-                    _ => -t.rotation.to_radians(),
-                }
-            };
-
-            let displacement = {
-                use HorizontalTextJustification as H;
-                match t.horizontal_text_justification {
-                    H::Center => point_from_dxf_point(&t.second_alignment_point).to_vec2(),
-                    _ => point_from_dxf_point(&t.location).to_vec2(),
-                }
-            };
-
+            let style_name = core::str::from_utf8(t.style_name).unwrap_or("");
             BlockChunk::Text(
                 ce,
                 TextItem {
                     text,
                     style: style_for_text_height(
                         styles,
-                        t.text_style_name.as_str(),
-                        t.text_height,
+                        style_name,
+                        t.height,
                         t.oblique_angle,
+                        t.width_factor,
                     ),
                     alignment,
                     insertion: DirectIsometry {
@@ -693,19 +626,23 @@ fn chunk_from_entity(
                 true,
             )
         }
-        EntityType::Attribute(ref a) => text_item_from_attribute(a, styles)
+        Entity::Attrib(common, a) => text_item_from_attrib(a, common, styles)
             .map(|ti| BlockChunk::Text(ce, ti, true))
             .unwrap_or(BlockChunk::Unsupported),
-        EntityType::AttributeDefinition(ref a) => text_item_from_attribute_definition(a, styles)
+        Entity::AttDef(common, a) => text_item_from_attdef(a, common, styles)
             .map(|ti| BlockChunk::Text(ce, ti, false))
             .unwrap_or(BlockChunk::Unsupported),
         _ => {
-            if let Some(p) = path_from_entity(e) {
-                BlockChunk::Path(
-                    e.common.lineweight_enum_value,
-                    recover_color_enum(&e.common.color),
-                    p,
-                )
+            if let Some(p) = path_from_entity(entity) {
+                let lw = if matches!(
+                    entity,
+                    Entity::Solid(..) | Entity::Trace(..) | Entity::Face3d(..) | Entity::Hatch(..)
+                ) {
+                    i16::MIN
+                } else {
+                    common.lineweight
+                };
+                BlockChunk::Path(lw, ce, p)
             } else {
                 BlockChunk::Unsupported
             }
@@ -715,68 +652,61 @@ fn chunk_from_entity(
 
 /// Convert an entity to a [`BezPath`].
 #[tracing::instrument(skip_all)]
-pub fn path_from_entity(e: &dxf::entities::Entity) -> Option<BezPath> {
-    match e.specific {
-        EntityType::Arc(ref a) => {
+pub fn path_from_entity(entity: &Entity<'_>) -> Option<BezPath> {
+    match entity {
+        Entity::Arc(common, a) => {
             // FIXME: currently only support viewing from +Z.
-            if a.normal.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return None;
             }
 
-            let dxf::entities::Arc {
-                center,
-                radius,
-                start_angle,
-                end_angle,
-                ..
-            } = a.clone();
             Some(
                 Arc {
-                    center: point_from_dxf_point(&center),
+                    center: point_from_dxf_point(a.center),
                     radii: Vec2 {
-                        x: radius,
-                        y: radius,
+                        x: a.radius,
+                        y: a.radius,
                     },
                     // DXF is y-up, so these are originally counterclockwise.
-                    start_angle: -start_angle.to_radians(),
-                    sweep_angle: -(end_angle - start_angle).rem_euclid(360.0).to_radians(),
+                    start_angle: -a.start_angle.to_radians(),
+                    sweep_angle: -(a.end_angle - a.start_angle).rem_euclid(360.0).to_radians(),
                     x_rotation: 0.0,
                 }
                 .to_path(DEFAULT_ACCURACY),
             )
         }
-        EntityType::Line(ref line) => {
+        Entity::Line(common, line) => {
             // FIXME: currently only support viewing from +Z.
-            if line.extrusion_direction.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return None;
             }
 
             let mut l = BezPath::new();
-            l.move_to(point_from_dxf_point(&line.p1));
-            l.line_to(point_from_dxf_point(&line.p2));
+            l.move_to(point_from_dxf_point(line.p1));
+            l.line_to(point_from_dxf_point(line.p2));
             Some(l)
         }
-        EntityType::Circle(ref circle) => {
+        Entity::Circle(common, circle) => {
             // FIXME: currently only support viewing from +Z.
-            if circle.normal.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return None;
             }
 
             Some(
                 Circle {
-                    center: point_from_dxf_point(&circle.center),
+                    center: point_from_dxf_point(circle.center),
                     radius: circle.radius,
                 }
                 .to_path(DEFAULT_ACCURACY),
             )
         }
-        EntityType::Ellipse(ref ellipse) => {
+        Entity::Ellipse(common, ellipse) => {
             // FIXME: currently only support viewing from +Z.
-            if ellipse.normal.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return None;
             }
 
-            let center = point_from_dxf_point(&ellipse.center);
+            let center = point_from_dxf_point(ellipse.center);
             let major_axis = Vec2 {
                 x: ellipse.major_axis.x,
                 y: -ellipse.major_axis.y,
@@ -792,22 +722,20 @@ pub fn path_from_entity(e: &dxf::entities::Entity) -> Option<BezPath> {
                     },
                     start_angle: -ellipse.start_parameter,
                     sweep_angle: -(ellipse.end_parameter - ellipse.start_parameter)
-                        .rem_euclid(2.0 * std::f64::consts::PI),
+                        .rem_euclid(2.0 * core::f64::consts::PI),
                     x_rotation: major_axis.angle(),
                 }
                 .to_path(DEFAULT_ACCURACY),
             )
         }
-        EntityType::LwPolyline(ref lwp) => {
+        Entity::LwPolyline(common, lwp) => {
             // FIXME: currently only support viewing from +Z.
-            if lwp.extrusion_direction.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return None;
             }
 
-            fn lwp_vertex_to_point(
-                dxf::LwPolylineVertex { x, y, .. }: dxf::LwPolylineVertex,
-            ) -> Point {
-                Point { x, y: -y }
+            fn lwp_vertex_to_point(v: &LwPolylineVertex) -> Point {
+                Point { x: v.x, y: -v.y }
             }
 
             if lwp.vertices.len() < 2 {
@@ -815,13 +743,13 @@ pub fn path_from_entity(e: &dxf::entities::Entity) -> Option<BezPath> {
             }
 
             let mut bp = BezPath::new();
-            bp.push(PathEl::MoveTo(lwp_vertex_to_point(lwp.vertices[0])));
+            bp.push(PathEl::MoveTo(lwp_vertex_to_point(&lwp.vertices[0])));
 
             for w in lwp.vertices.windows(2) {
                 let current = &w[0];
                 let next = &w[1];
-                let start = lwp_vertex_to_point(*current);
-                let end = lwp_vertex_to_point(*next);
+                let start = lwp_vertex_to_point(current);
+                let end = lwp_vertex_to_point(next);
 
                 // Bulge needs reversed because DXF is y-up
                 let bulge = -current.bulge;
@@ -834,32 +762,32 @@ pub fn path_from_entity(e: &dxf::entities::Entity) -> Option<BezPath> {
 
             Some(bp)
         }
-        EntityType::Polyline(ref pl) => {
+        Entity::Polyline(common, pl) => {
             // FIXME: currently only support viewing from +Z.
-            if pl.normal.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return None;
             }
 
-            use dxf::entities::Vertex;
             // FIXME: Polyline variable width and arcs, and a variety of other things.
             //        In some cases vertices might actually be indices?
-            if pl.is_polyface_mesh() || pl.is_3d_polygon_mesh() {
+            if pl.flags & 64 != 0 || pl.flags & 16 != 0 {
+                // polyface mesh or 3d polygon mesh
                 return None;
             }
 
-            let vertices: Vec<&Vertex> = pl.vertices().collect();
+            let vertices = &pl.vertices;
             if vertices.len() < 2 {
                 return None;
             }
 
             let mut bp = BezPath::new();
-            bp.push(PathEl::MoveTo(point_from_dxf_point(&vertices[0].location)));
+            bp.push(PathEl::MoveTo(point_from_dxf_point(vertices[0].location)));
 
             for w in vertices.windows(2) {
                 let current = &w[0];
                 let next = &w[1];
-                let start = point_from_dxf_point(&current.location);
-                let end = point_from_dxf_point(&next.location);
+                let start = point_from_dxf_point(current.location);
+                let end = point_from_dxf_point(next.location);
 
                 // Bulge needs reversed because DXF is y-up
                 let bulge = -current.bulge;
@@ -872,91 +800,24 @@ pub fn path_from_entity(e: &dxf::entities::Entity) -> Option<BezPath> {
 
             Some(bp)
         }
-        EntityType::Spline(ref s) => {
+        Entity::Spline(common, s) => {
             // FIXME: currently only support viewing from +Z.
-            if s.normal.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return None;
             }
 
-            let degree = s.degree_of_curve as usize;
-            if degree > 3 {
-                // Splines of degree > 3 are not supported.
-                return None;
-            }
-
-            let control_points: Vec<Point> =
-                s.control_points.iter().map(point_from_dxf_point).collect();
-            if control_points.len() < degree + 1 {
-                return None;
-            }
-
-            let knots = &s.knot_values;
-            if knots.len() < control_points.len() + degree + 1 {
-                return None;
-            }
-
-            // Find unique knot spans within the valid range.
-            let unique_knots: Vec<f64> = knots[degree..=(knots.len() - 1 - degree)]
+            let degree = s.degree as usize;
+            let control_points: Vec<Point> = s
+                .control_points
                 .iter()
-                .copied()
-                .map(OrdF64)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .map(|OrdF64(k)| k)
+                .map(|p| point_from_dxf_point(*p))
                 .collect();
 
-            if unique_knots.is_empty() {
-                return None;
-            }
-
             let mut bp = BezPath::new();
+            append_spline_to_path(&mut bp, degree, &control_points, &s.knot_values, true);
 
-            // Start at the first knot
-            let first_point = eval_spline(degree, &control_points, knots, unique_knots[0]);
-            bp.move_to(first_point);
-
-            for w in unique_knots.windows(2) {
-                let u0 = w[0];
-                let u1 = w[1];
-                match degree {
-                    1 => {
-                        let p1 = eval_spline(degree, &control_points, knots, u1);
-                        bp.line_to(p1);
-                    }
-                    2 => {
-                        let p0 = bp.elements().last().unwrap().end_point().unwrap();
-                        let p2 = eval_spline(degree, &control_points, knots, u1);
-                        let (dp, dcp, dk) =
-                            derivative_control_points(degree, &control_points, knots);
-                        let d0 = eval_spline(dp, &dcp, &dk, u0).to_vec2();
-                        let d1 = eval_spline(dp, &dcp, &dk, u1).to_vec2();
-                        if let Some(p1) = line_intersection(p0, d0, p2, d1) {
-                            bp.quad_to(p1, p2);
-                        } else {
-                            // Parallel tangents.
-                            bp.line_to(p2);
-                        }
-                    }
-                    3 => {
-                        let p0 = bp.elements().last().unwrap().end_point().unwrap();
-                        let p3 = eval_spline(degree, &control_points, knots, u1);
-                        let (dp, dcp, dk) =
-                            derivative_control_points(degree, &control_points, knots);
-                        let d0 = eval_spline(dp, &dcp, &dk, u0);
-                        let d1 = eval_spline(dp, &dcp, &dk, u1);
-                        let delta_u = u1 - u0;
-                        let p1 = Point {
-                            x: p0.x + (delta_u / 3.0) * d0.x,
-                            y: p0.y + (delta_u / 3.0) * d0.y,
-                        };
-                        let p2 = Point {
-                            x: p3.x - (delta_u / 3.0) * d1.x,
-                            y: p3.y - (delta_u / 3.0) * d1.y,
-                        };
-                        bp.curve_to(p1, p2, p3);
-                    }
-                    _ => unreachable!(), // Degrees > 3 filtered earlier.
-                }
+            if bp.elements().len() <= 1 {
+                return None;
             }
 
             if s.is_closed() {
@@ -965,27 +826,95 @@ pub fn path_from_entity(e: &dxf::entities::Entity) -> Option<BezPath> {
 
             Some(bp)
         }
-        EntityType::Solid(ref s) => {
+        Entity::Solid(common, s) => {
             // FIXME: currently only support viewing from +Z.
-            if s.extrusion_direction.z != 1.0 {
+            if common.extrusion.z != 1.0 {
                 return None;
             }
 
             let mut bp = BezPath::new();
-            bp.move_to(point_from_dxf_point(&s.first_corner));
-            bp.line_to(point_from_dxf_point(&s.third_corner));
+            bp.move_to(point_from_dxf_point(s.first_corner));
+            bp.line_to(point_from_dxf_point(s.third_corner));
             if s.third_corner != s.fourth_corner {
-                bp.line_to(point_from_dxf_point(&s.fourth_corner));
+                bp.line_to(point_from_dxf_point(s.fourth_corner));
             }
-            bp.line_to(point_from_dxf_point(&s.second_corner));
+            bp.line_to(point_from_dxf_point(s.second_corner));
             bp.close_path();
             Some(bp)
         }
-        _ => {
-            let specific = dxf_entity_type_name(&e.specific);
-            tracing::trace!(entity=e.common.handle.0, layer=e.common.layer, type=specific, "unhandled");
+        // TRACE is identical to SOLID in rendering.
+        Entity::Trace(common, s) => {
+            // FIXME: currently only support viewing from +Z.
+            if common.extrusion.z != 1.0 {
+                return None;
+            }
+            let mut bp = BezPath::new();
+            bp.move_to(point_from_dxf_point(s.first_corner));
+            bp.line_to(point_from_dxf_point(s.third_corner));
+            if s.third_corner != s.fourth_corner {
+                bp.line_to(point_from_dxf_point(s.fourth_corner));
+            }
+            bp.line_to(point_from_dxf_point(s.second_corner));
+            bp.close_path();
+            Some(bp)
+        }
+        // 3DFACE renders as a filled quad projected to 2D.
+        Entity::Face3d(_, f) => {
+            let mut bp = BezPath::new();
+            bp.move_to(point_from_dxf_point(f.first_corner));
+            bp.line_to(point_from_dxf_point(f.second_corner));
+            bp.line_to(point_from_dxf_point(f.third_corner));
+            if f.third_corner != f.fourth_corner {
+                bp.line_to(point_from_dxf_point(f.fourth_corner));
+            }
+            bp.close_path();
+            Some(bp)
+        }
+        // POINT renders as a small cross.
+        Entity::Point(common, p) => {
+            // FIXME: currently only support viewing from +Z.
+            if common.extrusion.z != 1.0 {
+                return None;
+            }
+            let c = point_from_dxf_point(p.location);
+            let d = 0.5; // half-size of cross marker
+            let mut bp = BezPath::new();
+            bp.move_to(Point::new(c.x - d, c.y));
+            bp.line_to(Point::new(c.x + d, c.y));
+            bp.move_to(Point::new(c.x, c.y - d));
+            bp.line_to(Point::new(c.x, c.y + d));
+            Some(bp)
+        }
+        // LEADER renders as a polyline through its vertices.
+        Entity::Leader(common, leader) => {
+            // FIXME: currently only support viewing from +Z.
+            if common.extrusion.z != 1.0 || leader.vertices.len() < 2 {
+                return None;
+            }
+            let mut bp = BezPath::new();
+            bp.move_to(point_from_dxf_point(leader.vertices[0]));
+            for v in &leader.vertices[1..] {
+                bp.line_to(point_from_dxf_point(*v));
+            }
+            Some(bp)
+        }
+        Entity::Hatch(common, hatch) => {
+            // FIXME: currently only support viewing from +Z.
+            if common.extrusion.z != 1.0 || hatch.solid_fill == 0 {
+                return None;
+            }
+            hatch_to_path(hatch)
+        }
+        Entity::Unknown(common, type_name) => {
+            tracing::trace!(
+                entity_type = core::str::from_utf8(type_name).unwrap_or("?"),
+                handle = core::str::from_utf8(common.handle).unwrap_or("?"),
+                layer = core::str::from_utf8(common.layer).unwrap_or("?"),
+                "unhandled entity type",
+            );
             None
         }
+        _ => None,
     }
 }
 
@@ -1122,10 +1051,311 @@ fn add_poly_segment(bp: &mut BezPath, start: Point, end: Point, bulge: f64) {
     });
 }
 
-/// Make a [`Point`] from the x and y of a [`dxf::Point`].
-pub fn point_from_dxf_point(p: &dxf::Point) -> Point {
-    let dxf::Point { x, y, .. } = *p;
-    Point { x, y: -y }
+/// Convert a HATCH entity's boundary paths to a filled [`BezPath`].
+fn hatch_to_path(hatch: &Hatch<'_>) -> Option<BezPath> {
+    if hatch.boundary_paths.is_empty() {
+        return None;
+    }
+
+    let mut bp = BezPath::new();
+
+    for path in &hatch.boundary_paths {
+        match path {
+            HatchBoundaryPath::Polyline(poly) => {
+                if poly.vertices.is_empty() {
+                    continue;
+                }
+                let (x0, y0, _) = poly.vertices[0];
+                bp.move_to(Point::new(x0, -y0));
+                for w in poly.vertices.windows(2) {
+                    let (_, _, bulge) = w[0];
+                    let (x1, y1, _) = w[1];
+                    let start = Point::new(w[0].0, -w[0].1);
+                    let end = Point::new(x1, -y1);
+                    // Negate bulge for Y-flip.
+                    add_poly_segment(&mut bp, start, end, -bulge);
+                }
+                if poly.is_closed && poly.vertices.len() > 1 {
+                    let last = poly.vertices.last().unwrap();
+                    let first = poly.vertices.first().unwrap();
+                    let start = Point::new(last.0, -last.1);
+                    let end = Point::new(first.0, -first.1);
+                    add_poly_segment(&mut bp, start, end, -last.2);
+                    bp.close_path();
+                }
+            }
+            HatchBoundaryPath::Edges(edges) => {
+                let mut first = true;
+                let mut last_end: Option<(f64, f64)> = None;
+                for edge in edges {
+                    // Detect disjoint subloops within the same edge boundary.
+                    let edge_start = match edge {
+                        HatchEdge::Line { start, .. } => Some(*start),
+                        HatchEdge::Arc {
+                            center,
+                            radius,
+                            start_angle,
+                            is_ccw,
+                            ..
+                        } => {
+                            let a = if *is_ccw { *start_angle } else { -*start_angle };
+                            Some((
+                                center.0 + radius * a.to_radians().cos(),
+                                center.1 + radius * a.to_radians().sin(),
+                            ))
+                        }
+                        _ => None,
+                    };
+                    if let (Some(prev), Some(cur)) = (last_end, edge_start) {
+                        let gap = ((prev.0 - cur.0).powi(2) + (prev.1 - cur.1).powi(2)).sqrt();
+                        if gap > 1.0 {
+                            // Close previous subloop and start a new one.
+                            bp.close_path();
+                            first = true;
+                        }
+                    }
+
+                    match edge {
+                        HatchEdge::Line { start, end } => {
+                            if first {
+                                bp.move_to(Point::new(start.0, -start.1));
+                                first = false;
+                            }
+                            last_end = Some(*end);
+                            bp.line_to(Point::new(end.0, -end.1));
+                        }
+                        HatchEdge::Arc {
+                            center,
+                            radius,
+                            start_angle,
+                            end_angle,
+                            is_ccw,
+                        } => {
+                            // For is_ccw=true: angles are in standard math convention.
+                            // After Y-flip: negate start angle, negative sweep.
+                            //
+                            // For is_ccw=false: DXF stores angles as their negatives
+                            // (reflected about X-axis). After Y-flip the double negation
+                            // cancels: use start_angle as-is, positive sweep.
+                            let (sa, sweep) = if *is_ccw {
+                                (
+                                    -start_angle.to_radians(),
+                                    -(end_angle - start_angle).rem_euclid(360.0).to_radians(),
+                                )
+                            } else {
+                                (
+                                    start_angle.to_radians(),
+                                    (end_angle - start_angle).rem_euclid(360.0).to_radians(),
+                                )
+                            };
+                            let arc = Arc {
+                                center: Point::new(center.0, -center.1),
+                                radii: Vec2 {
+                                    x: *radius,
+                                    y: *radius,
+                                },
+                                start_angle: sa,
+                                sweep_angle: sweep,
+                                x_rotation: 0.0,
+                            };
+                            // Compute DXF-space endpoint for subloop tracking.
+                            {
+                                let ea_actual = if *is_ccw {
+                                    let sweep_deg = (end_angle - start_angle).rem_euclid(360.0);
+                                    *start_angle + sweep_deg
+                                } else {
+                                    let sweep_deg = -(end_angle - start_angle).rem_euclid(360.0);
+                                    -(*start_angle) + sweep_deg
+                                };
+                                last_end = Some((
+                                    center.0 + radius * ea_actual.to_radians().cos(),
+                                    center.1 + radius * ea_actual.to_radians().sin(),
+                                ));
+                            }
+                            let seg = arc.to_path(DEFAULT_ACCURACY);
+                            for el in seg.elements() {
+                                if first && let PathEl::MoveTo(p) = el {
+                                    bp.move_to(*p);
+                                    first = false;
+                                    continue;
+                                }
+                                match el {
+                                    PathEl::MoveTo(_) => {} // skip interior movetos
+                                    _ => bp.push(*el),
+                                }
+                            }
+                            if first {
+                                first = false;
+                            }
+                        }
+                        HatchEdge::Ellipse {
+                            center,
+                            major_axis,
+                            minor_axis_ratio,
+                            start_angle,
+                            end_angle,
+                            is_ccw,
+                        } => {
+                            let major = Vec2 {
+                                x: major_axis.0,
+                                y: -major_axis.1,
+                            };
+                            let major_len = major.hypot();
+                            if major_len < 1e-10 {
+                                continue;
+                            }
+                            let minor_len = major_len * minor_axis_ratio;
+                            let x_rotation = major.angle();
+                            let (sa, sweep) = if *is_ccw {
+                                (
+                                    -start_angle.to_radians(),
+                                    -(end_angle - start_angle).rem_euclid(360.0).to_radians(),
+                                )
+                            } else {
+                                (
+                                    start_angle.to_radians(),
+                                    (end_angle - start_angle).rem_euclid(360.0).to_radians(),
+                                )
+                            };
+                            let arc = Arc {
+                                center: Point::new(center.0, -center.1),
+                                radii: Vec2 {
+                                    x: major_len,
+                                    y: minor_len,
+                                },
+                                start_angle: sa,
+                                sweep_angle: sweep,
+                                x_rotation,
+                            };
+                            let seg = arc.to_path(DEFAULT_ACCURACY);
+                            for el in seg.elements() {
+                                if first && let PathEl::MoveTo(p) = el {
+                                    bp.move_to(*p);
+                                    first = false;
+                                    continue;
+                                }
+                                match el {
+                                    PathEl::MoveTo(_) => {}
+                                    _ => bp.push(*el),
+                                }
+                            }
+                            if first {
+                                first = false;
+                            }
+                            // Ellipse endpoint tracking is complex; reset to
+                            // avoid false gap detection.
+                            last_end = None;
+                        }
+                        HatchEdge::Spline {
+                            degree,
+                            knots,
+                            control_points,
+                            ..
+                        } => {
+                            let pts: Vec<Point> = control_points
+                                .iter()
+                                .map(|&(x, y, _)| Point::new(x, -y))
+                                .collect();
+                            append_spline_to_path(&mut bp, *degree as usize, &pts, knots, first);
+                            first = false;
+                            last_end = None;
+                        }
+                    }
+                }
+                bp.close_path();
+            }
+        }
+    }
+
+    if bp.elements().len() > 1 {
+        Some(bp)
+    } else {
+        None
+    }
+}
+
+/// Append B-spline curve segments to `bp` for the given control points and knots.
+///
+/// If `move_to_start` is true, a `move_to` is emitted for the first point;
+/// otherwise the caller is responsible for positioning.
+fn append_spline_to_path(
+    bp: &mut BezPath,
+    degree: usize,
+    control_points: &[Point],
+    knots: &[f64],
+    move_to_start: bool,
+) {
+    if degree > 3 || control_points.len() < degree + 1 {
+        return;
+    }
+    if knots.len() < control_points.len() + degree + 1 {
+        return;
+    }
+
+    let unique_knots: Vec<f64> = knots[degree..=(knots.len() - 1 - degree)]
+        .iter()
+        .copied()
+        .map(OrdF64)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|OrdF64(k)| k)
+        .collect();
+
+    if unique_knots.is_empty() {
+        return;
+    }
+
+    let first_point = eval_spline(degree, control_points, knots, unique_knots[0]);
+    if move_to_start {
+        bp.move_to(first_point);
+    } else {
+        bp.line_to(first_point);
+    }
+
+    for w in unique_knots.windows(2) {
+        let u0 = w[0];
+        let u1 = w[1];
+        match degree {
+            1 => {
+                bp.line_to(eval_spline(degree, control_points, knots, u1));
+            }
+            2 => {
+                let p0 = bp.elements().last().unwrap().end_point().unwrap();
+                let p2 = eval_spline(degree, control_points, knots, u1);
+                let (dp, dcp, dk) = derivative_control_points(degree, control_points, knots);
+                let d0 = eval_spline(dp, &dcp, &dk, u0).to_vec2();
+                let d1 = eval_spline(dp, &dcp, &dk, u1).to_vec2();
+                if let Some(p1) = line_intersection(p0, d0, p2, d1) {
+                    bp.quad_to(p1, p2);
+                } else {
+                    bp.line_to(p2);
+                }
+            }
+            3 => {
+                let p0 = bp.elements().last().unwrap().end_point().unwrap();
+                let p3 = eval_spline(degree, control_points, knots, u1);
+                let (dp, dcp, dk) = derivative_control_points(degree, control_points, knots);
+                let d0 = eval_spline(dp, &dcp, &dk, u0);
+                let d1 = eval_spline(dp, &dcp, &dk, u1);
+                let delta_u = u1 - u0;
+                let p1 = Point {
+                    x: p0.x + (delta_u / 3.0) * d0.x,
+                    y: p0.y + (delta_u / 3.0) * d0.y,
+                };
+                let p2 = Point {
+                    x: p3.x - (delta_u / 3.0) * d1.x,
+                    y: p3.y - (delta_u / 3.0) * d1.y,
+                };
+                bp.curve_to(p1, p2, p3);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Make a [`Point`] from the x and y of a [`Point3`].
+pub fn point_from_dxf_point(p: Point3) -> Point {
+    Point { x: p.x, y: -p.y }
 }
 
 /// Provide information about a drawing after loading it.
@@ -1134,24 +1364,12 @@ pub fn point_from_dxf_point(p: &dxf::Point) -> Point {
     reason = "Not particularly useful, and members don't implement Debug."
 )]
 pub struct DrawingInfo {
-    drawing: Drawing,
+    // Reserved for future use.
 }
 
 impl DrawingInfo {
-    pub(crate) fn new(drawing: Drawing) -> Self {
-        Self { drawing }
-    }
-
-    /// Get an entity in the drawing.
-    pub fn get_entity(&self, eh: EntityHandle) -> &dxf::entities::Entity {
-        let dxf::DrawingItem::Entity(e) = self
-            .drawing
-            .item_by_handle(dxf::Handle(eh.0.get()))
-            .unwrap()
-        else {
-            unreachable!();
-        };
-        e
+    pub(crate) fn new() -> Self {
+        Self {}
     }
 }
 
@@ -1241,32 +1459,25 @@ fn style_size_is_zero(s: &StyleSet<Option<Color>>) -> bool {
         .is_none_or(|x| matches!(x, StyleProperty::FontSize(0_f32)))
 }
 
-/// Recover color enum value from [`dxf::Color`] as it is currently not in the API.
-fn recover_color_enum(c: &dxf::Color) -> i16 {
-    if c.is_by_layer() {
-        256
-    } else if c.is_by_entity() {
-        257
-    } else if c.is_by_block() {
-        0
-    } else if let Some(index) = c.index() {
-        index as i16
-    } else {
-        -1
-    }
+/// Parse a handle (hex string bytes) into a [`NonZeroU64`].
+fn parse_handle(h: &[u8]) -> Option<NonZeroU64> {
+    let s = core::str::from_utf8(h).ok()?;
+    let v = u64::from_str_radix(s, 16).ok()?;
+    NonZeroU64::new(v)
 }
 
 #[derive(Clone, Copy)]
-struct LayerInfo<'a> {
+struct LayerInfo {
     handle: LayerHandle,
-    layer: &'a dxf::tables::Layer,
+    color_index: i16,
+    lineweight: i16,
     is_on: bool,
 }
 
-fn insert_instance_transforms(ins: &dxf::entities::Insert) -> alloc::vec::Vec<Affine> {
-    let base_transform = Affine::scale_non_uniform(ins.x_scale_factor, ins.y_scale_factor);
+fn insert_instance_transforms(ins: &Insert<'_>) -> alloc::vec::Vec<Affine> {
+    let base_transform = Affine::scale_non_uniform(ins.x_scale, ins.y_scale);
     let rotation = -ins.rotation.to_radians();
-    let location = point_from_dxf_point(&ins.location).to_vec2();
+    let location = point_from_dxf_point(ins.location).to_vec2();
     let mut transforms = alloc::vec::Vec::new();
     for i in 0..ins.row_count {
         for j in 0..ins.column_count {
@@ -1287,14 +1498,31 @@ fn insert_instance_transforms(ins: &dxf::entities::Insert) -> alloc::vec::Vec<Af
 /// Load a DXF from a path into a [`TDDrawing`].
 #[cfg(feature = "std")]
 #[tracing::instrument(skip_all)]
-pub fn load_file_default_layers(path: impl AsRef<Path>) -> DxfResult<TDDrawing> {
-    let drawing = Drawing::load_file(path)?;
-    load_drawing_default_layers(drawing)
+pub fn load_file_default_layers(
+    path: impl AsRef<Path>,
+) -> Result<TDDrawing, Box<dyn std::error::Error + Send + Sync>> {
+    let data = std::fs::read(path)?;
+    // Check if already binary DXF (starts with sentinel).
+    let binary;
+    let scan_data = if data.starts_with(b"AutoCAD Binary DXF") {
+        &data
+    } else {
+        // Text DXF: convert to binary.
+        let mut buf = Vec::new();
+        let mut sink = dxfbin::BinarySink::new(&mut buf);
+        dxfbin::convert_all(&data, &mut sink).map_err(|e| format!("{e}"))?;
+        binary = buf;
+        &binary
+    };
+    let drawing = dxfscan::scan(scan_data).map_err(|e| format!("{e}"))?;
+    load_drawing(&drawing)
 }
 
-/// Translate a loaded [`Drawing`] into a [`TDDrawing`].
+/// Translate a scanned drawing into a [`TDDrawing`].
 #[tracing::instrument(skip_all)]
-pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
+fn load_drawing(
+    drawing: &Drawing<'_>,
+) -> Result<TDDrawing, Box<dyn std::error::Error + Send + Sync>> {
     let mut gb = GraphicsBag::default();
     let mut rl = RenderLayer::default();
     let mut item_entity_map = BTreeMap::new();
@@ -1310,33 +1538,40 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
 
     let mut enabled_layers = BTreeSet::new();
     let mut layer_names = BTreeMap::new();
-    let mut layer_info_by_name = BTreeMap::new();
-    for l in drawing.layers() {
-        let handle = LayerHandle(NonZeroU64::new(l.handle.0).unwrap());
-        if l.is_layer_on {
+    let mut layer_info_by_name: BTreeMap<&str, LayerInfo> = BTreeMap::new();
+    let mut next_synthetic_handle: u64 = 0xFFFF_FF00_0000_0000;
+    for l in drawing.layers.iter() {
+        let handle = LayerHandle(parse_handle(l.handle).unwrap_or_else(|| {
+            next_synthetic_handle += 1;
+            NonZeroU64::new(next_synthetic_handle).unwrap()
+        }));
+        if l.is_on() {
             enabled_layers.insert(handle);
         }
-        layer_names.insert(handle, l.name.as_str().into());
+        let name = core::str::from_utf8(l.name).unwrap_or("");
+        layer_names.insert(handle, sync::Arc::<str>::from(name));
         layer_info_by_name.insert(
-            l.name.as_str(),
+            name,
             LayerInfo {
                 handle,
-                layer: l,
-                is_on: l.is_layer_on,
+                color_index: l.color_index(),
+                lineweight: l.lineweight,
+                is_on: l.is_on(),
             },
         );
     }
 
     let styles: BTreeMap<&str, StyleSet<Option<Color>>> = drawing
-        .styles()
+        .styles
+        .iter()
         .map(
             #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
             |s| {
                 // FIXME: I'm told this is actually the cap height and not the em size,
                 //        at least for shx line fonts.
-                // When this is zero, the height from the TEXT/MTEXT entity is used;
-                // when this is nonzero, the height from the TXT/MTEXT is ignored.
-                let size = s.text_height;
+                // The entity's text height overrides this when non-zero (see
+                // style_for_text_height).
+                let size = s.height;
                 let mut pstyle: StyleSet<Option<Color>> = StyleSet::new(size as f32);
                 pstyle.insert(StyleProperty::LineHeight(LineHeight::FontSizeRelative(1.0)));
                 pstyle.insert(StyleProperty::FontWidth(FontWidth::from_ratio(
@@ -1359,7 +1594,8 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                 //
                 //       Sometimes the file names have the .shx, sometimes they do not,
                 //       there appears to be neither rhyme nor reason to it.
-                match s.primary_font_file_name.as_str() {
+                let font_name = core::str::from_utf8(s.primary_font_file).unwrap_or("");
+                match font_name {
                     // Monospace version of txt.shx
                     "monotxt" | "monotxt.shx" => pstyle.insert(GenericFamily::Monospace.into()),
                     // Italic roman type lined once.
@@ -1389,7 +1625,8 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                     _ => pstyle.insert(GenericFamily::SansSerif.into()),
                 };
 
-                (s.name.as_str(), pstyle)
+                let style_name = core::str::from_utf8(s.name).unwrap_or("");
+                (style_name, pstyle)
             },
         )
         .collect();
@@ -1397,37 +1634,39 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
     let mut blocks: BTreeMap<&str, Vec<BlockChunk>> = BTreeMap::new();
     {
         // Blocks that depend on another block which is not realized.
-        let mut unresolved_blocks: Vec<&dxf::Block> = drawing.blocks().collect();
+        let mut unresolved_blocks: Vec<&Block<'_>> = drawing.blocks.iter().collect();
         let mut there_is_absolutely_no_hope = false;
         while !unresolved_blocks.is_empty() && !there_is_absolutely_no_hope {
             // I acknowledge that this is technically not very efficient in some cases
             // but I am too lazy to build a DAG here, and rarely will it matter.
             there_is_absolutely_no_hope = true;
             'block: for b in unresolved_blocks.iter() {
+                let block_name = core::str::from_utf8(b.name).unwrap_or("");
                 // Form up shapes with contiguous line weight and color.
                 let mut lines = BezPath::new();
                 // Chunk blocks by the combination of line weight and color.
                 // To retain drawing order, multiple chunks may be emitted for a single block.
                 let mut chunks: Vec<BlockChunk> = vec![];
                 if b.entities.is_empty() {
-                    blocks.insert(b.name.as_str(), chunks);
+                    blocks.insert(block_name, chunks);
                     continue;
                 }
 
-                let resolve_style = |layer: &dxf::tables::Layer, lw: i16, ce: i16| {
+                let resolve_style = |layer_info: &LayerInfo, lw: i16, ce: i16| {
                     let line_weight = if lw == -2 {
-                        if layer.line_weight.raw_value() < 0 {
+                        if layer_info.lineweight < 0 {
                             25_i16
                         } else {
-                            layer.line_weight.raw_value()
+                            layer_info.lineweight
                         }
                     } else {
                         lw
                     };
                     let color = if ce == 256 {
                         // BYLAYER: resolve to a palette value during block resolution.
-                        if let Some(i) = layer.color.index() {
-                            i as i16
+                        let ci = layer_info.color_index;
+                        if ci > 0 {
+                            ci
                         } else {
                             // white if layer doesn't have a resolvable color.
                             7_i16
@@ -1447,29 +1686,44 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                     }
                 };
 
-                let Some(first_layer_info) = find_layer_for(b.entities[0].common.layer.as_str())
-                else {
+                let first_common = b.entities[0].common();
+                let first_layer_name = core::str::from_utf8(first_common.layer).unwrap_or("");
+                let Some(first_layer_info) = find_layer_for(first_layer_name) else {
                     continue;
                 };
-                let mut cur_style = resolve_style(
-                    first_layer_info.layer,
-                    b.entities[0].common.lineweight_enum_value,
-                    recover_color_enum(&b.entities[0].common.color),
-                );
+                let first_ce = effective_color(first_common);
+                let first_lw = if matches!(
+                    b.entities[0],
+                    Entity::Solid(..) | Entity::Trace(..) | Entity::Face3d(..) | Entity::Hatch(..)
+                ) {
+                    i16::MIN
+                } else {
+                    first_common.lineweight
+                };
+                let mut cur_style = resolve_style(first_layer_info, first_lw, first_ce);
 
                 for e in b.entities.iter() {
-                    let Some(layer_info) = find_layer_for(e.common.layer.as_str()) else {
+                    let ecommon = e.common();
+                    let layer_name = core::str::from_utf8(ecommon.layer).unwrap_or("");
+                    let Some(layer_info) = find_layer_for(layer_name) else {
                         continue;
                     };
+                    let ece = effective_color(ecommon);
                     let style = resolve_style(
-                        layer_info.layer,
-                        if matches!(e.specific, EntityType::Solid(..)) {
+                        layer_info,
+                        if matches!(
+                            e,
+                            Entity::Solid(..)
+                                | Entity::Trace(..)
+                                | Entity::Face3d(..)
+                                | Entity::Hatch(..)
+                        ) {
                             // Use `i16::MIN` for solid fills.
                             i16::MIN
                         } else {
-                            e.common.lineweight_enum_value
+                            ecommon.lineweight
                         },
-                        recover_color_enum(&e.common.color),
+                        ece,
                     );
                     if style != cur_style {
                         chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, lines));
@@ -1477,19 +1731,21 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                         cur_style = style;
                     }
 
-                    match e.specific {
+                    match e {
                         // Try the next block if this one depends on an unresolved block.
-                        EntityType::Insert(dxf::entities::Insert { ref name, .. })
-                            if !blocks.contains_key(name.as_str()) =>
+                        Entity::Insert(_, ins)
+                            if !blocks
+                                .contains_key(core::str::from_utf8(ins.name).unwrap_or("")) =>
                         {
                             continue 'block;
                         }
-                        EntityType::Insert(ref ins) => {
+                        Entity::Insert(ins_common, ins) => {
                             // FIXME: currently only support viewing from +Z.
-                            if ins.extrusion_direction.z != 1.0 {
+                            if ins_common.extrusion.z != 1.0 {
                                 continue;
                             }
-                            if let Some(b) = blocks.get(ins.name.as_str()) {
+                            let ins_name = core::str::from_utf8(ins.name).unwrap_or("");
+                            if let Some(b) = blocks.get(ins_name) {
                                 let transforms = insert_instance_transforms(ins);
 
                                 if !lines.is_empty() {
@@ -1531,7 +1787,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                             reason = "It doesn't matter"
                                         )]
                                         BlockChunk::Text(ce, ti, render_with_attributes) => {
-                                            if ins.__has_attributes && !render_with_attributes {
+                                            if ins.has_attributes && !render_with_attributes {
                                                 continue;
                                             }
                                             let TextItem {
@@ -1619,8 +1875,11 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                 }
 
                                 // Render any attribute values attached to this insert.
-                                for a in ins.attributes() {
-                                    if let Some(ti) = text_item_from_attribute(a, &styles) {
+                                for a in ins.attributes.iter() {
+                                    // Use the insert's common for extrusion since attribs
+                                    // inherit the insert's coordinate system.
+                                    if let Some(ti) = text_item_from_attrib(a, ins_common, &styles)
+                                    {
                                         chunks.push(BlockChunk::Text(cur_style.1, ti, true));
                                     }
                                 }
@@ -1628,6 +1887,23 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                             }
                         }
                         _ => match chunk_from_entity(e, &styles) {
+                            BlockChunk::Path(_, _, s)
+                                if matches!(
+                                    e,
+                                    Entity::Solid(..)
+                                        | Entity::Trace(..)
+                                        | Entity::Face3d(..)
+                                        | Entity::Hatch(..)
+                                ) =>
+                            {
+                                // Filled entities get their own chunk to avoid
+                                // merging with stroked geometry.
+                                if !lines.is_empty() {
+                                    chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, lines));
+                                    lines = BezPath::new();
+                                }
+                                chunks.push(BlockChunk::Path(cur_style.0, cur_style.1, s));
+                            }
                             BlockChunk::Path(_, _, s) => {
                                 lines.extend(s);
                             }
@@ -1660,7 +1936,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                 }
 
                 // Apply base point offset so INSERT location aligns with `base_point`.
-                let block_base = point_from_dxf_point(&b.base_point).to_vec2();
+                let block_base = point_from_dxf_point(b.base_point).to_vec2();
                 if block_base != Vec2::ZERO {
                     let base_transform = Affine::translate(-block_base);
                     for chunk in chunks.iter_mut() {
@@ -1677,9 +1953,10 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                 }
 
                 there_is_absolutely_no_hope = false;
-                blocks.insert(b.name.as_str(), chunks);
+                blocks.insert(block_name, chunks);
             }
-            unresolved_blocks.retain(|b| !blocks.contains_key(b.name.as_str()));
+            unresolved_blocks
+                .retain(|b| !blocks.contains_key(core::str::from_utf8(b.name).unwrap_or("")));
         }
     }
 
@@ -1687,36 +1964,40 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
     let mut paints: BTreeMap<(u32, u64), PaintHandle> = BTreeMap::new();
     let mut fills: BTreeMap<u32, PaintHandle> = BTreeMap::new();
 
-    for e in drawing.entities() {
-        let layer_info = if e.common.layer.is_empty() {
+    for e in drawing.entities.iter() {
+        let ecommon = e.common();
+        let layer_name = core::str::from_utf8(ecommon.layer).unwrap_or("");
+        let layer_info = if layer_name.is_empty() {
             layer_info_by_name.get("0")
         } else {
-            layer_info_by_name.get(e.common.layer.as_str())
+            layer_info_by_name.get(layer_name)
         };
 
-        if !e.common.is_visible
-            || !e.common.layer.is_empty() && !layer_info.is_some_and(|x| x.is_on)
-        {
+        if !ecommon.is_visible || !layer_name.is_empty() && !layer_info.is_some_and(|x| x.is_on) {
             continue;
         }
 
         let Some(layer_info) = layer_info else {
             continue;
         };
-        let eh = EntityHandle(NonZeroU64::new(e.common.handle.0).unwrap());
+        let eh = EntityHandle(parse_handle(ecommon.handle).unwrap_or_else(|| {
+            next_synthetic_handle += 1;
+            NonZeroU64::new(next_synthetic_handle).unwrap()
+        }));
         let lh = layer_info.handle;
 
-        let layer = layer_info.layer;
+        let ece = effective_color(ecommon);
 
         let mut resolve_paint = |gb: &mut GraphicsBag, lw: i16, c: i16| {
             // Resolve color.
             let opaque_color = match c {
-                // BYENTITY
-                257 => e.common.color_24_bit as u32,
+                // BYENTITY (true color)
+                257 => ecommon.color_24_bit as u32,
                 // BYLAYER
                 256 => {
-                    if let Some(i) = layer.color.index() {
-                        ACI[i as usize]
+                    let ci = layer_info.color_index;
+                    if ci > 0 && (ci as usize) < ACI.len() {
+                        ACI[ci as usize]
                     } else {
                         u32::MAX
                     }
@@ -1727,7 +2008,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                 _ => u32::MAX,
             };
             let combined_color =
-                (opaque_color << 8) | (0xFF - (e.common.transparency as u32 & 0xFF));
+                (opaque_color << 8) | (0xFF - (ecommon.transparency as u32 & 0xFF));
 
             /// Default line weight.
             const LWDEFAULT: u64 = 250 * MICROMETER;
@@ -1737,12 +2018,12 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                 -3 => LWDEFAULT,
                 // BYLAYER.
                 -2 => {
-                    if layer.line_weight.raw_value() <= 0 {
+                    if layer_info.lineweight <= 0 {
                         // BYLAYER and BYBLOCK are both meaningless in a layer,
                         // therefore, use the default for all enumerations.
                         LWDEFAULT
                     } else {
-                        layer.line_weight.raw_value() as u64 * 10 * MICROMETER
+                        layer_info.lineweight as u64 * 10 * MICROMETER
                     }
                 }
                 // BYBLOCK (-1) Should not occur at the entity level, use default.
@@ -1784,15 +2065,20 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
         let entity_paint = resolve_paint(
             &mut gb,
             if matches!(
-                e.specific,
-                EntityType::Solid(..) | EntityType::Text(..) | EntityType::MText(..)
+                e,
+                Entity::Solid(..)
+                    | Entity::Trace(..)
+                    | Entity::Face3d(..)
+                    | Entity::Hatch(..)
+                    | Entity::Text(..)
+                    | Entity::MText(..)
             ) {
                 // Use `i16::MIN` for solid fills.
                 i16::MIN
             } else {
-                e.common.lineweight_enum_value
+                ecommon.lineweight
             },
-            recover_color_enum(&e.common.color),
+            ece,
         );
 
         let mut push_item = |gb: &mut GraphicsBag, item: GraphicsItem| {
@@ -1801,14 +2087,15 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
             entity_layer_map.insert(eh, lh);
         };
 
-        match e.specific {
-            EntityType::Insert(ref ins) => {
+        match e {
+            Entity::Insert(ins_common, ins) => {
                 // FIXME: currently only support viewing from +Z.
-                if ins.extrusion_direction.z != 1.0 {
+                if ins_common.extrusion.z != 1.0 {
                     continue;
                 }
 
-                if let Some(b) = blocks.get(ins.name.as_str()) {
+                let ins_name = core::str::from_utf8(ins.name).unwrap_or("");
+                if let Some(b) = blocks.get(ins_name) {
                     let transforms = insert_instance_transforms(ins);
 
                     for chunk in b {
@@ -1818,13 +2105,13 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                     &mut gb,
                                     if *lw == -1 {
                                         // BYBLOCK: inherit from this insert.
-                                        e.common.lineweight_enum_value
+                                        ecommon.lineweight
                                     } else {
                                         *lw
                                     },
                                     if *ce == 0 {
                                         // BYBLOCK: inherit from this insert.
-                                        recover_color_enum(&e.common.color)
+                                        ece
                                     } else {
                                         *ce
                                     },
@@ -1845,7 +2132,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                             }
                             #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
                             BlockChunk::Text(ce, ti, render_with_attributes) => {
-                                if ins.__has_attributes && !render_with_attributes {
+                                if ins.has_attributes && !render_with_attributes {
                                     continue;
                                 }
                                 let TextItem {
@@ -1888,11 +2175,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                                 let paint = resolve_paint(
                                     &mut gb,
                                     i16::MIN,
-                                    if *ce == 0 {
-                                        recover_color_enum(&e.common.color)
-                                    } else {
-                                        *ce
-                                    },
+                                    if *ce == 0 { ece } else { *ce },
                                 );
 
                                 for transform in transforms.iter().copied() {
@@ -1936,8 +2219,8 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                 }
 
                 // Render any attribute values attached to this insert.
-                let paint = resolve_paint(&mut gb, i16::MIN, recover_color_enum(&e.common.color));
-                for a in ins.attributes() {
+                let paint = resolve_paint(&mut gb, i16::MIN, ece);
+                for a in ins.attributes.iter() {
                     if let Some(TextItem {
                         text,
                         style,
@@ -1945,7 +2228,7 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                         insertion,
                         max_inline_size,
                         attachment_point,
-                    }) = text_item_from_attribute(a, &styles)
+                    }) = text_item_from_attrib(a, ins_common, &styles)
                     {
                         push_item(
                             &mut gb,
@@ -1961,6 +2244,51 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
                             }
                             .into(),
                         );
+                    }
+                }
+            }
+            // DIMENSION entities render via their anonymous block.
+            Entity::Dimension(_, dim) => {
+                let dim_block_name = core::str::from_utf8(dim.block_name).unwrap_or("");
+                if let Some(b) = blocks.get(dim_block_name) {
+                    for chunk in b {
+                        match chunk {
+                            BlockChunk::Path(lw, ce, clines) => {
+                                let chunk_paint = resolve_paint(
+                                    &mut gb,
+                                    if *lw == -1 { ecommon.lineweight } else { *lw },
+                                    if *ce == 0 { ece } else { *ce },
+                                );
+                                push_item(
+                                    &mut gb,
+                                    FatShape {
+                                        path: sync::Arc::from(clines.clone()),
+                                        paint: chunk_paint,
+                                        ..Default::default()
+                                    }
+                                    .into(),
+                                );
+                            }
+                            #[allow(clippy::cast_possible_truncation, reason = "It doesn't matter")]
+                            BlockChunk::Text(_, ti, _) => {
+                                let paint = resolve_paint(&mut gb, ecommon.lineweight, ece);
+                                push_item(
+                                    &mut gb,
+                                    FatText {
+                                        transform: Default::default(),
+                                        paint,
+                                        text: ti.text.clone(),
+                                        style: ti.style.clone(),
+                                        alignment: ti.alignment,
+                                        insertion: ti.insertion,
+                                        max_inline_size: ti.max_inline_size,
+                                        attachment_point: ti.attachment_point,
+                                    }
+                                    .into(),
+                                );
+                            }
+                            BlockChunk::Unsupported => {}
+                        }
                     }
                 }
             }
@@ -2016,78 +2344,24 @@ pub fn load_drawing_default_layers(drawing: Drawing) -> DxfResult<TDDrawing> {
         entity_layer_map,
         enabled_layers,
         layer_names,
-        info: DrawingInfo::new(drawing),
+        info: DrawingInfo::new(),
         restroke_paints: sync::Arc::from(restroke_paints.as_slice()),
     })
 }
 
-/// Convert a [`dxf::enums::AttachmentPoint`] to a [`tabulon::text::AttachmentPoint`].
-fn dxf_attachment_point_to_tabulon(
-    attachment_point: dxf::enums::AttachmentPoint,
-) -> AttachmentPoint {
-    use AttachmentPoint::*;
-    use dxf::enums::AttachmentPoint as d;
+/// Convert an MTEXT `attachment_point` i16 to a [`tabulon::text::AttachmentPoint`].
+fn dxf_attachment_point_to_tabulon(attachment_point: i16) -> AttachmentPoint {
     match attachment_point {
-        d::TopLeft => TopLeft,
-        d::TopCenter => TopCenter,
-        d::TopRight => TopRight,
-        d::MiddleLeft => MiddleLeft,
-        d::MiddleCenter => MiddleCenter,
-        d::MiddleRight => MiddleRight,
-        d::BottomLeft => BottomLeft,
-        d::BottomCenter => BottomCenter,
-        d::BottomRight => BottomRight,
-    }
-}
-
-/// Get the type name of a DXF `EntityType`
-fn dxf_entity_type_name(entity_type: &EntityType) -> &str {
-    match entity_type {
-        EntityType::Face3D(_) => "Face3D",
-        EntityType::Solid3D(_) => "Solid3D",
-        EntityType::ProxyEntity(_) => "ProxyEntity",
-        EntityType::Arc(_) => "Arc",
-        EntityType::ArcAlignedText(_) => "ArcAlignedText",
-        EntityType::AttributeDefinition(_) => "AttributeDefinition",
-        EntityType::Attribute(_) => "Attribute",
-        EntityType::Body(_) => "Body",
-        EntityType::Circle(_) => "Circle",
-        EntityType::RotatedDimension(_) => "RotatedDimension",
-        EntityType::RadialDimension(_) => "RadialDimension",
-        EntityType::DiameterDimension(_) => "DiameterDimension",
-        EntityType::AngularThreePointDimension(_) => "AngularThreePointDimension",
-        EntityType::OrdinateDimension(_) => "OrdinateDimension",
-        EntityType::Ellipse(_) => "Ellipse",
-        EntityType::Helix(_) => "Helix",
-        EntityType::Image(_) => "Image",
-        EntityType::Insert(_) => "Insert",
-        EntityType::Leader(_) => "Leader",
-        EntityType::Light(_) => "Light",
-        EntityType::Line(_) => "Line",
-        EntityType::LwPolyline(_) => "LwPolyline",
-        EntityType::MLine(_) => "MLine",
-        EntityType::MText(_) => "MText",
-        EntityType::OleFrame(_) => "OleFrame",
-        EntityType::Ole2Frame(_) => "Ole2Frame",
-        EntityType::ModelPoint(_) => "ModelPoint",
-        EntityType::Polyline(_) => "Polyline",
-        EntityType::Ray(_) => "Ray",
-        EntityType::Region(_) => "Region",
-        EntityType::RText(_) => "RText",
-        EntityType::Section(_) => "Section",
-        EntityType::Seqend(_) => "Seqend",
-        EntityType::Shape(_) => "Shape",
-        EntityType::Solid(_) => "Solid",
-        EntityType::Spline(_) => "Spline",
-        EntityType::Text(_) => "Text",
-        EntityType::Tolerance(_) => "Tolerance",
-        EntityType::Trace(_) => "Trace",
-        EntityType::DgnUnderlay(_) => "DgnUnderlay",
-        EntityType::DwfUnderlay(_) => "DwfUnderlay",
-        EntityType::PdfUnderlay(_) => "PdfUnderlay",
-        EntityType::Vertex(_) => "Vertex",
-        EntityType::Wipeout(_) => "Wipeout",
-        EntityType::XLine(_) => "XLine",
+        1 => AttachmentPoint::TopLeft,
+        2 => AttachmentPoint::TopCenter,
+        3 => AttachmentPoint::TopRight,
+        4 => AttachmentPoint::MiddleLeft,
+        5 => AttachmentPoint::MiddleCenter,
+        6 => AttachmentPoint::MiddleRight,
+        7 => AttachmentPoint::BottomLeft,
+        8 => AttachmentPoint::BottomCenter,
+        9 => AttachmentPoint::BottomRight,
+        _ => AttachmentPoint::TopLeft,
     }
 }
 
@@ -2097,155 +2371,43 @@ mod tests {
 
     #[test]
     fn decode_text_control_codes() {
-        assert_eq!(&*decode_dxf_text_value("A%%c%%d%%p%%%B"), "A∅°±%B");
-        assert_eq!(&*decode_dxf_text_value("A%%uB%%uC"), "ABC");
+        assert_eq!(
+            &*decode_dxf_text_value(b"A%%c%%d%%p%%%B"),
+            "A\u{2205}\u{00B0}\u{00B1}%B"
+        );
+        assert_eq!(&*decode_dxf_text_value(b"A%%uB%%uC"), "ABC");
     }
 
     #[test]
     fn decode_text_unicode_decimal() {
         // Per DXF control codes, %%nnn is a Unicode codepoint expressed as decimal.
-        assert_eq!(&*decode_dxf_text_value("A%%123B"), "A{B");
-        assert_eq!(&*decode_dxf_text_value("%%176"), "°");
+        assert_eq!(&*decode_dxf_text_value(b"A%%123B"), "A{B");
+        assert_eq!(&*decode_dxf_text_value(b"%%176"), "\u{00B0}");
     }
 
     #[test]
     fn decode_mtext_inline_formatting() {
-        let empty: &[String] = &[];
+        let empty: &[&[u8]] = &[];
         assert_eq!(
-            &*decode_dxf_mtext_value("{\\LHello\\l} world\\PSecond", empty),
+            &*decode_dxf_mtext_value(b"{\\LHello\\l} world\\PSecond", empty),
             "Hello world\nSecond"
         );
         assert_eq!(
-            &*decode_dxf_mtext_value("Frac: \\S1#4; end", empty),
+            &*decode_dxf_mtext_value(b"Frac: \\S1#4; end", empty),
             "Frac: 1/4 end"
         );
         assert_eq!(
-            &*decode_dxf_mtext_value("Unicode: \\U+00B0", empty),
-            "Unicode: °"
+            &*decode_dxf_mtext_value(b"Unicode: \\U+00B0", empty),
+            "Unicode: \u{00B0}"
         );
         assert_eq!(
-            &*decode_dxf_mtext_value("Color: \\C1;Red", empty),
+            &*decode_dxf_mtext_value(b"Color: \\C1;Red", empty),
             "Color: Red"
         );
         assert_eq!(
-            &*decode_dxf_mtext_value("Esc: \\\\ \\{ \\} \\~", empty),
+            &*decode_dxf_mtext_value(b"Esc: \\\\ \\{ \\} \\~", empty),
             "Esc: \\ { }  "
         );
-    }
-
-    #[test]
-    fn insert_applies_block_base_point_offset() {
-        let mut drawing = Drawing::new();
-
-        let block = dxf::Block {
-            name: "B".to_owned(),
-            layer: "0".to_owned(),
-            base_point: dxf::Point::new(100.0, 100.0, 0.0),
-            entities: vec![dxf::entities::Entity::new(EntityType::Line(
-                dxf::entities::Line::new(
-                    dxf::Point::new(100.0, 100.0, 0.0),
-                    dxf::Point::new(110.0, 100.0, 0.0),
-                ),
-            ))],
-            ..Default::default()
-        };
-        drawing.add_block(block);
-
-        let ins = dxf::entities::Insert {
-            name: "B".to_owned(),
-            location: dxf::Point::new(0.0, 0.0, 0.0),
-            ..Default::default()
-        };
-        drawing.add_entity(dxf::entities::Entity::new(EntityType::Insert(ins)));
-
-        let td = load_drawing_default_layers(drawing).expect("drawing should translate");
-
-        let mut found = false;
-        for ih in td.item_entity_map.keys() {
-            let GraphicsItem::FatShape(FatShape { path, .. }) = td.graphics.get(*ih) else {
-                continue;
-            };
-            let els = path.elements();
-            let Some(PathEl::MoveTo(p0)) = els.first().copied() else {
-                continue;
-            };
-            let Some(PathEl::LineTo(p1)) = els.get(1).copied() else {
-                continue;
-            };
-
-            // Note: tabulon_dxf flips Y on import; subtracting base_point should still land at 0.
-            let eps = 1e-9;
-            if (p0.x - 0.0).abs() < eps
-                && (p0.y - 0.0).abs() < eps
-                && (p1.x - 10.0).abs() < eps
-                && (p1.y - 0.0).abs() < eps
-            {
-                found = true;
-                break;
-            }
-        }
-
-        assert!(found, "expected line moved by block base_point offset");
-    }
-
-    #[test]
-    fn insert_attributes_render_as_text() {
-        let mut drawing = Drawing::new();
-
-        // Define a simple block.
-        let block = dxf::Block {
-            name: "Gridline Bubble".to_owned(),
-            layer: "0".to_owned(),
-            entities: vec![dxf::entities::Entity::new(EntityType::Line(
-                dxf::entities::Line::new(
-                    dxf::Point::new(0.0, 0.0, 0.0),
-                    dxf::Point::new(1.0, 0.0, 0.0),
-                ),
-            ))],
-            ..Default::default()
-        };
-        drawing.add_block(block);
-
-        // Add an insert with attributes.
-        let mut ins = dxf::entities::Insert {
-            name: "Gridline Bubble".to_owned(),
-            location: dxf::Point::new(10.0, 10.0, 0.0),
-            __has_attributes: true,
-            ..Default::default()
-        };
-
-        let a1 = dxf::entities::Attribute {
-            text_height: 15.0,
-            value: "3b".to_owned(),
-            location: dxf::Point::new(9.0, 11.0, 0.0),
-            horizontal_text_justification: HorizontalTextJustification::Center,
-            vertical_text_justification: VerticalTextJustification::Middle,
-            second_alignment_point: dxf::Point::new(10.0, 11.0, 0.0),
-            ..Default::default()
-        };
-        ins.add_attribute(&mut drawing, a1);
-
-        let a2 = dxf::entities::Attribute {
-            text_height: 7.5,
-            value: "WF".to_owned(),
-            location: dxf::Point::new(10.0, 12.0, 0.0),
-            ..Default::default()
-        };
-        ins.add_attribute(&mut drawing, a2);
-
-        drawing.add_entity(dxf::entities::Entity::new(EntityType::Insert(ins)));
-
-        let td = load_drawing_default_layers(drawing).expect("drawing should translate");
-
-        let mut texts: Vec<String> = vec![];
-        for ih in td.item_entity_map.keys() {
-            if let GraphicsItem::FatText(t) = td.graphics.get(*ih) {
-                texts.push(t.text.as_ref().to_owned());
-            }
-        }
-
-        assert!(texts.iter().any(|t| t == "3b"), "expected to find \"3b\"");
-        assert!(texts.iter().any(|t| t == "WF"), "expected to find \"WF\"");
     }
 
     #[test]
@@ -2253,7 +2415,7 @@ mod tests {
         let mut styles = BTreeMap::new();
         styles.insert("FT-TEXT", StyleSet::new(250.0));
 
-        let style = style_for_text_height(&styles, "FT-TEXT", 1.744_120_1, 0.0);
+        let style = style_for_text_height(&styles, "FT-TEXT", 1.744_120_1, 0.0, 1.0);
         let fs = style
             .inner()
             .get(&discriminant(&StyleProperty::FontSize(0.0)))

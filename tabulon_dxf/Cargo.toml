@@ -13,18 +13,13 @@ std = ["tabulon/std"]
 libm = ["tabulon/libm"]
 
 [dependencies]
-dxf = { version = "0.6", git = "https://github.com/xorgy/dxf-rs", rev = "3311c61" }
-getrandom = "0.3.1"
+dxfscan = "0.1.0"
+dxfbin = { version = "0.1", default-features = false }
 joto_constants = "0.2.0"
 parley = { workspace = true }
 tracing = { workspace = true }
-uuid = "1.9"
 
 tabulon = { workspace = true }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.3.1", features = ["wasm_js"] }
-uuid = { version = "1.9", features = ["js", "serde", "v4"] }
 
 [lints]
 workspace = true
