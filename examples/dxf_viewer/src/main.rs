@@ -495,10 +495,7 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
                                         if let Some(pick) = pick {
                                             let pick_duration = Instant::now()
                                                 .saturating_duration_since(pick_started);
-                                            eprintln!(
-                                                "{:#?}",
-                                                viewer.td.info.get_entity(pick).specific
-                                            );
+                                            eprintln!("Picked entity: {pick:?}");
                                             eprintln!("Pick took {pick_duration:?}");
                                         }
                                         viewer.pick = pick;
@@ -825,7 +822,8 @@ impl ApplicationHandler for TabulonDxfViewer<'_> {
 /// Load a drawing file into a drawing, and print some stats.
 fn load_drawing(p: impl AsRef<Path>) -> Result<TDDrawing> {
     let drawing_load_started = Instant::now();
-    let mut drawing = tabulon_dxf::load_file_default_layers(p)?;
+    let mut drawing =
+        tabulon_dxf::load_file_default_layers(p).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let drawing_load_duration = Instant::now().saturating_duration_since(drawing_load_started);
     eprintln!("Drawing took {drawing_load_duration:?} to load and translate.");

@@ -540,7 +540,7 @@ fn main() -> Result<()> {
     }
 
     let mut td = tabulon_dxf::load_file_default_layers(&input)
-        .with_context(|| format!("loading DXF from {input:?}"))?;
+        .map_err(|e| anyhow::anyhow!("loading DXF from {input:?}: {e}"))?;
 
     light_adapt_paints(&mut td.graphics, &td.render_layer);
 
