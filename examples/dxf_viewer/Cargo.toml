@@ -21,8 +21,8 @@ tracing.workspace = true
 tracy-client = { workspace = true, optional = true }
 ui-events = "0.3.0"
 ui-events-winit = "0.3.0"
-vello = "0.7.0"
-winit = { version = "0.30.10", default-features = false }
+vello = "0.8.0"
+winit = { version = "0.30.13", default-features = false }
 dpi = "0.1.2"
 
 static_aabb2d_index = { version = "2.0.0", features = ["unsafe_optimizations"] }
