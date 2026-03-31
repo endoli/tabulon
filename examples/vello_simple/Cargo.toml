@@ -10,8 +10,8 @@ publish = false
 [dependencies]
 anyhow = "1.0.98"
 pollster = "0.4"
-vello = "0.7.0"
-winit = "0.30.10"
+vello = "0.8.0"
+winit = "0.30.13"
 
 tabulon = { version = "0.1.0", path = "../../tabulon" }
 tabulon_vello = { workspace = true }

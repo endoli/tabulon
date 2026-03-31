@@ -129,10 +129,10 @@ fn font_stack_css(text: &FatText) -> Option<String> {
     use parley::StyleProperty;
 
     text.style.inner().values().find_map(|p| match p {
-        StyleProperty::FontStack(stack) => Some(match stack {
-            parley::style::FontStack::Source(s) => s.as_ref().to_owned(),
-            parley::style::FontStack::Single(fam) => fam.to_string(),
-            parley::style::FontStack::List(list) => list
+        StyleProperty::FontFamily(family) => Some(match family {
+            parley::style::FontFamily::Source(s) => s.as_ref().to_owned(),
+            parley::style::FontFamily::Single(fam) => fam.to_string(),
+            parley::style::FontFamily::List(list) => list
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
